@@ -54,8 +54,44 @@ async function sendProgressUpdate(
   return update;
 }
 
-// Show UI
-figma.showUI(__html__, { width: 350, height: 600 });
+// Show UI (modal on the canvas — not inside the Plugins sidebar)
+(function openPluginUi() {
+  const html =
+    typeof __html__ !== "undefined" && __html__
+      ? __html__
+      : '<html><body style="font:14px sans-serif;padding:16px">Cursor MCP: <code>__html__</code> is empty. Re-import the plugin from <code>manifest.json</code> (same folder as <code>ui.html</code>).</body></html>';
+  const size = { width: 350, height: 600 };
+  try {
+    figma.showUI(html, {
+      width: size.width,
+      height: size.height,
+      title: "Talk To Figma MCP",
+    });
+  } catch (e) {
+    try {
+      figma.showUI(html, size);
+    } catch (e2) {
+      figma.notify(
+        "Cursor MCP could not open UI: " + (e2.message || String(e2))
+      );
+      throw e2;
+    }
+  }
+})();
+
+function sendDefaultChannelDescription() {
+  const rootName = figma.root && typeof figma.root.name === "string"
+    ? figma.root.name
+    : "";
+  const fileName = rootName.trim();
+  if (!fileName) return;
+  figma.ui.postMessage({
+    type: "default-channel-description",
+    description: fileName,
+  });
+}
+
+sendDefaultChannelDescription();
 
 // Plugin commands from UI
 figma.ui.onmessage = async (msg) => {
@@ -92,6 +128,7 @@ figma.ui.onmessage = async (msg) => {
 
 // Listen for plugin commands from menu
 figma.on("run", ({ command }) => {
+  sendDefaultChannelDescription();
   figma.ui.postMessage({ type: "auto-connect" });
 });
 
@@ -224,11 +261,6 @@ async function handleCommand(command, params) {
       return await setLayoutSizing(params);
     case "set_item_spacing":
       return await setItemSpacing(params);
-    case "get_reactions":
-      if (!params || !params.nodeIds || !Array.isArray(params.nodeIds)) {
-        throw new Error("Missing or invalid nodeIds parameter");
-      }
-      return await getReactions(params.nodeIds);  
     case "set_default_connector":
       return await setDefaultConnector(params);
     case "create_connections":
@@ -1271,8 +1303,16 @@ async function createComponentInstance(params) {
 
 async function exportNodeAsImage(params) {
   const { nodeId, scale = 1 } = params || {};
-
-  const format = "PNG";
+  const raw = (params && params.format) || "PNG";
+  const upper = String(raw).toUpperCase();
+  const fmt =
+    upper === "JPG" || upper === "JPEG"
+      ? "JPG"
+      : upper === "SVG"
+        ? "SVG"
+        : upper === "PDF"
+          ? "PDF"
+          : "PNG";
 
   if (!nodeId) {
     throw new Error("Missing nodeId parameter");
@@ -1288,15 +1328,20 @@ async function exportNodeAsImage(params) {
   }
 
   try {
-    const settings = {
-      format: format,
-      constraint: { type: "SCALE", value: scale },
-    };
-
-    const bytes = await node.exportAsync(settings);
+    let bytes;
+    if (fmt === "SVG") {
+      bytes = await node.exportAsync({ format: "SVG" });
+    } else if (fmt === "PDF") {
+      bytes = await node.exportAsync({ format: "PDF" });
+    } else {
+      bytes = await node.exportAsync({
+        format: fmt === "JPG" ? "JPG" : "PNG",
+        constraint: { type: "SCALE", value: scale },
+      });
+    }
 
     let mimeType;
-    switch (format) {
+    switch (fmt) {
       case "PNG":
         mimeType = "image/png";
         break;
@@ -1313,14 +1358,12 @@ async function exportNodeAsImage(params) {
         mimeType = "application/octet-stream";
     }
 
-    // Proper way to convert Uint8Array to base64
     const base64 = customBase64Encode(bytes);
-    // const imageData = `data:${mimeType};base64,${base64}`;
 
     return {
       nodeId,
-      format,
-      scale,
+      format: fmt,
+      scale: fmt === "PNG" || fmt === "JPG" ? scale : undefined,
       mimeType,
       imageData: base64,
     };

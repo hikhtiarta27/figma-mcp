@@ -4,6 +4,7 @@ import { Server, ServerWebSocket } from "bun";
 
 // Store clients by channel
 const channels = new Map<string, Set<ServerWebSocket<any>>>();
+const channelDescriptions = new Map<string, string>();
 
 function handleConnection(ws: ServerWebSocket<any>) {
   // Don't add to clients immediately - wait for channel join
@@ -86,8 +87,49 @@ const server = Bun.serve({
         }
         console.log(`Full message:`, JSON.stringify(data, null, 2));
 
+        // MCP / any client: list channels that have at least one open connection (no join required)
+        if (data.type === "list_channels") {
+          const requestId = data.id;
+          if (!requestId || typeof requestId !== "string") {
+            ws.send(JSON.stringify({
+              type: "error",
+              message: "list_channels requires a string id",
+            }));
+            return;
+          }
+          const list: { name: string; clientCount: number; description?: string }[] = [];
+          for (const [name, clients] of channels) {
+            let clientCount = 0;
+            for (const c of clients) {
+              if (c.readyState === WebSocket.OPEN) clientCount++;
+            }
+            if (clientCount > 0) {
+              const description = channelDescriptions.get(name);
+              list.push({
+                name,
+                clientCount,
+                ...(description ? { description } : {}),
+              });
+            }
+          }
+          list.sort((a, b) => a.name.localeCompare(b.name));
+          ws.send(JSON.stringify({
+            type: "channel_list",
+            id: requestId,
+            channels: list,
+          }));
+          console.log(`\n✓ list_channels → ${list.length} active channel(s)`);
+          return;
+        }
+
         if (data.type === "join") {
           const channelName = data.channel;
+          const channelDescription =
+            typeof data.channel_description === "string"
+              ? data.channel_description.trim()
+              : typeof data.message?.params?.channel_description === "string"
+                ? data.message.params.channel_description.trim()
+                : "";
           if (!channelName || typeof channelName !== "string") {
             ws.send(JSON.stringify({
               type: "error",
@@ -99,6 +141,9 @@ const server = Bun.serve({
           // Create channel if it doesn't exist
           if (!channels.has(channelName)) {
             channels.set(channelName, new Set());
+          }
+          if (channelDescription) {
+            channelDescriptions.set(channelName, channelDescription);
           }
 
           // Add client to channel
@@ -204,6 +249,15 @@ const server = Bun.serve({
       channels.forEach((clients) => {
         clients.delete(ws);
       });
+      for (const [channelName, clients] of channels.entries()) {
+        let openClientCount = 0;
+        for (const client of clients) {
+          if (client.readyState === WebSocket.OPEN) openClientCount++;
+        }
+        if (openClientCount === 0) {
+          channelDescriptions.delete(channelName);
+        }
+      }
     }
   }
 });

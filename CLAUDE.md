@@ -36,6 +36,7 @@ Runs inside Figma. `code.js` is the plugin main thread handling 30+ commands via
 
 ## Key Patterns
 
+- **Icon / illustration export (SVG vs PNG)**: Try **`export_node_as_svg`** first (optional **`writePath`** to save a `.svg` file). **Use `.svg`** only if the subtree has **fewer than 3** vector primitives (`VECTOR`, `ELLIPSE`, `STAR`, `LINE`, `POLYGON`, `BOOLEAN_OPERATION`) **and** the decoded SVG is **≤ 8 KB** UTF-8. Otherwise use **`export_node_as_image`** **`format: "PNG"`** (e.g. `scale: 2`–`4`), optional **`writePath`**, or the **`--export-png`** CLI on the MCP binary (quote node ids with `;` in the shell).
 - **Colors**: Figma uses RGBA 0-1 range. The MCP tools accept 0-1 floats and the filter converts to hex for display.
 - **Logging**: All logs go to stderr. Stdout is reserved for MCP protocol messages.
 - **Timeouts**: 30s default per command. Progress updates from the plugin reset the inactivity timer.

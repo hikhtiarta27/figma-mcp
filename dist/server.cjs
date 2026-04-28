@@ -23,11 +23,91 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 
 // src/talk_to_figma_mcp/server.ts
+var import_node_fs = __toESM(require("fs"), 1);
+var import_node_path = __toESM(require("path"), 1);
 var import_mcp = require("@modelcontextprotocol/sdk/server/mcp.js");
 var import_stdio = require("@modelcontextprotocol/sdk/server/stdio.js");
 var import_zod = require("zod");
 var import_ws = __toESM(require("ws"), 1);
 var import_uuid = require("uuid");
+function decodeBase64ExportAsSvg(imageDataBase64) {
+  const buf = Buffer.from(imageDataBase64, "base64");
+  if (buf.length >= 4 && buf[0] === 137 && buf[1] === 80 && buf[2] === 78 && buf[3] === 71) {
+    return { ok: false, kind: "png" };
+  }
+  if (buf.length >= 3 && buf[0] === 255 && buf[1] === 216 && buf[2] === 255) {
+    return { ok: false, kind: "jpeg" };
+  }
+  const asciiHead = buf.subarray(0, Math.min(8, buf.length)).toString("ascii");
+  if (asciiHead.startsWith("%PDF")) {
+    return { ok: false, kind: "pdf" };
+  }
+  const svg = buf.toString("utf-8").trimStart();
+  if (!svg.startsWith("<")) {
+    return { ok: false, kind: "unknown" };
+  }
+  return { ok: true, svg };
+}
+function resolveWritePathUnderCwd(rel) {
+  const root = import_node_path.default.resolve(process.cwd());
+  const targetAbs = import_node_path.default.resolve(root, rel);
+  const relToRoot = import_node_path.default.relative(root, targetAbs);
+  if (relToRoot.startsWith("..") || import_node_path.default.isAbsolute(relToRoot)) {
+    throw new Error(`writePath must stay under server cwd: ${rel}`);
+  }
+  return targetAbs;
+}
+function parsePluginSvgExport(imageDataBase64, nodeId) {
+  const decoded = decodeBase64ExportAsSvg(imageDataBase64);
+  if (decoded.ok === false) {
+    const kind = decoded.kind;
+    const hint = kind === "png" ? "The Figma plugin returned PNG (SVG was requested). Reload the dev plugin from this repo (src/cursor_mcp_plugin) so export_node_as_image uses format SVG in exportAsync." : "The export payload was not valid SVG text.";
+    return {
+      ok: false,
+      kind,
+      message: `${hint}
+
+nodeId: ${nodeId}
+detected: ${kind}`
+    };
+  }
+  return { ok: true, svg: decoded.svg };
+}
+function writeSvgUtf8UnderCwd(relPath, svg) {
+  const abs = resolveWritePathUnderCwd(relPath);
+  import_node_fs.default.mkdirSync(import_node_path.default.dirname(abs), { recursive: true });
+  import_node_fs.default.writeFileSync(abs, svg, "utf-8");
+  return {
+    rel: import_node_path.default.relative(process.cwd(), abs),
+    bytes: Buffer.byteLength(svg, "utf-8")
+  };
+}
+function mcpContentForSvgExport(args2) {
+  const content = [];
+  if (args2.writePath) {
+    const w = writeSvgUtf8UnderCwd(args2.writePath, args2.svg);
+    content.push({
+      type: "text",
+      text: `Wrote ${w.rel} (${w.bytes} bytes, UTF-8).`
+    });
+  }
+  const intro = args2.fromImageTool ? args2.writePath ? `SVG export for node ${args2.nodeId} (file written; XML below for clipboard, a .svg file, or inline HTML).
+
+` : `SVG export for node ${args2.nodeId}. Use the XML below in a .svg file, clipboard, or inline in HTML.
+
+` : args2.writePath ? `SVG export for node ${args2.nodeId} (file written; full markup below).
+
+` : `SVG export for node ${args2.nodeId}.
+
+`;
+  content.push({ type: "text", text: intro + args2.svg });
+  content.push({
+    type: "image",
+    data: args2.imageDataBase64,
+    mimeType: args2.mimeType || "image/svg+xml"
+  });
+  return { content };
+}
 var logger = {
   info: (message) => process.stderr.write(`[INFO] ${message}
 `),
@@ -43,6 +123,7 @@ var logger = {
 var ws = null;
 var pendingRequests = /* @__PURE__ */ new Map();
 var currentChannel = null;
+var currentChannelDescription = null;
 var server = new import_mcp.McpServer({
   name: "TalkToFigmaMCP",
   version: "1.0.0"
@@ -51,7 +132,85 @@ var args = process.argv.slice(2);
 var serverArg = args.find((arg) => arg.startsWith("--server="));
 var serverUrl = serverArg ? serverArg.split("=")[1] : "localhost";
 var WS_URL = serverUrl === "localhost" ? `ws://${serverUrl}` : `wss://${serverUrl}`;
-server.tool(
+var socketPortArg = args.find((a) => a.startsWith("--port="));
+var FIGMA_SOCKET_PORT = (() => {
+  const n = socketPortArg ? Number(socketPortArg.split("=", 2)[1]) : Number(process.env.PORT || "3055");
+  return Number.isFinite(n) && n > 0 ? n : 3055;
+})();
+function cliArgValue(argv, prefix) {
+  const hit = argv.find((a) => a.startsWith(prefix));
+  return hit === void 0 ? void 0 : hit.slice(prefix.length);
+}
+function tryParseExportPngCli(argv) {
+  if (!argv.includes("--export-png")) {
+    return null;
+  }
+  const channel = cliArgValue(argv, "--channel=") ?? "";
+  const nodeId = cliArgValue(argv, "--node=") ?? "";
+  const outRel = cliArgValue(argv, "--out=") ?? "";
+  const scaleRaw = cliArgValue(argv, "--scale=");
+  const scale = scaleRaw !== void 0 && scaleRaw !== "" ? Number(scaleRaw) : 4;
+  if (!channel || !nodeId || !outRel) {
+    process.stderr.write(
+      "Usage: cursor-talk-to-figma-mcp --export-png --channel=CH --node=NODE_ID --out=relative/path.png [--scale=4] [--port=3055]\nRequires WebSocket relay (bun socket) and the Figma plugin on the same channel.\n"
+    );
+    process.exit(1);
+  }
+  if (!Number.isFinite(scale) || scale <= 0) {
+    process.stderr.write("Invalid --scale (expected a positive number).\n");
+    process.exit(1);
+  }
+  return { channel, nodeId, outRel, scale };
+}
+var EXPORT_PNG_CLI = tryParseExportPngCli(args);
+var CLI_EXPORT_PNG_MODE = EXPORT_PNG_CLI !== null;
+function parseClientConnectionMode(argv) {
+  const modeArg = argv.find((a) => a.startsWith("--mode="));
+  const fromArg = modeArg?.split("=", 2)[1]?.trim().toLowerCase();
+  const fromEnv = process.env.MCP_MODE?.trim().toLowerCase();
+  const raw = fromArg || fromEnv || "full";
+  if (raw === "read-only" || raw === "readonly") return "read-only";
+  if (raw === "full") return "full";
+  logger.warn(
+    `Unknown connection mode "${raw}"; expected full or read-only. Defaulting to full.`
+  );
+  return "full";
+}
+var CLIENT_CONNECTION_MODE = parseClientConnectionMode(args);
+var READ_ONLY_TOOL_NAMES = /* @__PURE__ */ new Set([
+  "join_channel",
+  "get_active_channels",
+  "get_document_info",
+  "get_selection",
+  "read_my_design",
+  "get_node_info",
+  "get_nodes_info",
+  "get_annotations",
+  "scan_nodes_by_types",
+  "scan_text_nodes",
+  "get_styles",
+  "get_local_components",
+  "get_instance_overrides",
+  "export_node_as_image",
+  "export_node_as_svg",
+  "copy_node_as_svg",
+  "set_focus",
+  "set_selections"
+]);
+function figmaTool(...toolArgs) {
+  const name = toolArgs[0];
+  if (CLIENT_CONNECTION_MODE === "read-only" && !READ_ONLY_TOOL_NAMES.has(name)) {
+    return;
+  }
+  server.tool(...toolArgs);
+}
+function figmaPrompt(...promptArgs) {
+  if (CLIENT_CONNECTION_MODE === "read-only") {
+    return;
+  }
+  server.prompt(...promptArgs);
+}
+figmaTool(
   "get_document_info",
   "Get detailed information about the current Figma document",
   {},
@@ -78,7 +237,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "get_selection",
   "Get information about the current selection in Figma",
   {},
@@ -105,7 +264,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "read_my_design",
   "Get detailed information about the current selection in Figma, including all node details",
   {},
@@ -132,7 +291,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "get_node_info",
   "Get detailed information about a specific node in Figma",
   {
@@ -236,7 +395,7 @@ function filterFigmaNode(node) {
   }
   return filtered;
 }
-server.tool(
+figmaTool(
   "get_nodes_info",
   "Get detailed information about multiple nodes in Figma",
   {
@@ -270,7 +429,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "create_rectangle",
   "Create a new rectangle in Figma",
   {
@@ -311,7 +470,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "create_frame",
   "Create a new frame in Figma",
   {
@@ -412,7 +571,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "create_text",
   "Create a new text element in Figma",
   {
@@ -463,7 +622,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "set_fill_color",
   "Set the fill color of a node in Figma can be TextNode or FrameNode",
   {
@@ -500,7 +659,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "set_stroke_color",
   "Set the stroke color of a node in Figma",
   {
@@ -539,7 +698,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "move_node",
   "Move a node to a new position in Figma",
   {
@@ -571,7 +730,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "clone_node",
   "Clone an existing node in Figma",
   {
@@ -603,7 +762,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "resize_node",
   "Resize a node in Figma",
   {
@@ -639,7 +798,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "delete_node",
   "Delete a node from Figma",
   {
@@ -668,7 +827,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "delete_multiple_nodes",
   "Delete multiple nodes from Figma at once",
   {
@@ -697,31 +856,61 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "export_node_as_image",
-  "Export a node as an image from Figma",
+  "Export a node from Figma. PNG/JPG: returns image (base64). SVG: returns plaintext XML plus an SVG image preview when the client supports it. PDF: returns base64 image block (binary preview). Optional writePath: for PNG/JPG write raw bytes; for SVG write UTF-8 markup (relative to MCP server cwd, no path traversal). Prefer export_node_as_svg when you only need SVG. Without an MCP client, same relay setup: run this binary with --export-png --channel=... --node=... --out=relative.png [--scale=4] [--port=3055].",
   {
     nodeId: import_zod.z.string().describe("The ID of the node to export"),
     format: import_zod.z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Export format"),
-    scale: import_zod.z.number().positive().optional().describe("Export scale")
+    scale: import_zod.z.number().positive().optional().describe("Export scale (PNG/JPG only; ignored for SVG/PDF)"),
+    writePath: import_zod.z.string().optional().describe(
+      "If set: PNG/JPG write decoded raster bytes; SVG write UTF-8 XML. Path is relative to the MCP server cwd (no path traversal)."
+    )
   },
-  async ({ nodeId, format, scale }) => {
+  async ({ nodeId, format, scale, writePath }) => {
     try {
+      const resolvedFormat = format || "PNG";
       const result = await sendCommandToFigma("export_node_as_image", {
         nodeId,
-        format: format || "PNG",
+        format: resolvedFormat,
         scale: scale || 1
       });
       const typedResult = result;
-      return {
-        content: [
-          {
-            type: "image",
-            data: typedResult.imageData,
-            mimeType: typedResult.mimeType || "image/png"
-          }
-        ]
-      };
+      const mimeType = typedResult.mimeType || "image/png";
+      if (resolvedFormat === "SVG" || mimeType === "image/svg+xml") {
+        const parsed = parsePluginSvgExport(typedResult.imageData, nodeId);
+        if (parsed.ok === false) {
+          return {
+            content: [{ type: "text", text: parsed.message }]
+          };
+        }
+        return mcpContentForSvgExport({
+          nodeId,
+          imageDataBase64: typedResult.imageData,
+          mimeType: typedResult.mimeType || "image/svg+xml",
+          svg: parsed.svg,
+          writePath,
+          fromImageTool: true
+        });
+      }
+      const content = [];
+      if (writePath && (resolvedFormat === "PNG" || resolvedFormat === "JPG" || mimeType === "image/png" || mimeType === "image/jpeg")) {
+        const abs = resolveWritePathUnderCwd(writePath);
+        const buf = Buffer.from(typedResult.imageData, "base64");
+        import_node_fs.default.mkdirSync(import_node_path.default.dirname(abs), { recursive: true });
+        import_node_fs.default.writeFileSync(abs, buf);
+        const rel = import_node_path.default.relative(process.cwd(), abs);
+        content.push({
+          type: "text",
+          text: `Wrote ${rel} (${buf.byteLength} bytes).`
+        });
+      }
+      content.push({
+        type: "image",
+        data: typedResult.imageData,
+        mimeType
+      });
+      return { content };
     } catch (error) {
       return {
         content: [
@@ -734,7 +923,75 @@ server.tool(
     }
   }
 );
-server.tool(
+async function runExportNodeAsSvgTool(params) {
+  const result = await sendCommandToFigma("export_node_as_image", {
+    nodeId: params.nodeId,
+    format: "SVG",
+    scale: 1
+  });
+  const typedResult = result;
+  const parsed = parsePluginSvgExport(typedResult.imageData, params.nodeId);
+  if (parsed.ok === false) {
+    return { content: [{ type: "text", text: parsed.message }] };
+  }
+  return mcpContentForSvgExport({
+    nodeId: params.nodeId,
+    imageDataBase64: typedResult.imageData,
+    mimeType: typedResult.mimeType || "image/svg+xml",
+    svg: parsed.svg,
+    writePath: params.writePath,
+    fromImageTool: false
+  });
+}
+figmaTool(
+  "export_node_as_svg",
+  "Export a Figma node as SVG: returns UTF-8 markup in the response and an SVG image preview when supported. Optional writePath writes a .svg file under the MCP server cwd (no path traversal). Use this instead of format SVG on export_node_as_image when you only need vector output.",
+  {
+    nodeId: import_zod.z.string().describe("The ID of the node to export as SVG"),
+    writePath: import_zod.z.string().optional().describe(
+      "If set, write UTF-8 SVG markup to this path relative to the MCP server cwd (no path traversal)."
+    )
+  },
+  async ({ nodeId, writePath }) => {
+    try {
+      return await runExportNodeAsSvgTool({ nodeId, writePath });
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error exporting node as SVG: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ]
+      };
+    }
+  }
+);
+figmaTool(
+  "copy_node_as_svg",
+  "Alias of export_node_as_svg (identical parameters and behavior). Prefer export_node_as_svg in new workflows.",
+  {
+    nodeId: import_zod.z.string().describe("The ID of the node to export as SVG"),
+    writePath: import_zod.z.string().optional().describe(
+      "If set, write UTF-8 SVG markup to this path relative to the MCP server cwd (no path traversal)."
+    )
+  },
+  async ({ nodeId, writePath }) => {
+    try {
+      return await runExportNodeAsSvgTool({ nodeId, writePath });
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error exporting SVG: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ]
+      };
+    }
+  }
+);
+figmaTool(
   "set_text_content",
   "Set the text content of an existing text node in Figma",
   {
@@ -768,7 +1025,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "get_styles",
   "Get all styles from the current Figma document",
   {},
@@ -795,7 +1052,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "get_local_components",
   "Get all local components from the Figma document",
   {},
@@ -822,7 +1079,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "get_annotations",
   "Get all annotations in the current document or specific node",
   {
@@ -855,7 +1112,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "set_annotation",
   "Create or update an annotation",
   {
@@ -896,7 +1153,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "set_multiple_annotations",
   "Set multiple annotations parallelly in a node",
   {
@@ -975,7 +1232,7 @@ ${failedResults.map(
     }
   }
 );
-server.tool(
+figmaTool(
   "create_component_instance",
   "Create an instance of a component in Figma. For LOCAL components (from get_local_components), use componentId with the id field. For published LIBRARY components, use componentKey with the publishedKey field.",
   {
@@ -1015,7 +1272,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "get_instance_overrides",
   "Get all override properties from a selected component instance. These overrides can be applied to other instances, which will swap them to match the source component.",
   {
@@ -1047,7 +1304,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "set_instance_overrides",
   "Apply previously copied overrides to selected component instances. Target instances will be swapped to the source component and all copied override properties will be applied.",
   {
@@ -1093,7 +1350,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "set_corner_radius",
   "Set the corner radius of a node in Figma",
   {
@@ -1131,7 +1388,7 @@ server.tool(
     }
   }
 );
-server.prompt(
+figmaPrompt(
   "design_strategy",
   "Best practices for working with Figma designs",
   (extra) => {
@@ -1217,30 +1474,7 @@ Example Login Screen Structure:
     };
   }
 );
-server.prompt(
-  "read_design_strategy",
-  "Best practices for reading Figma designs",
-  (extra) => {
-    return {
-      messages: [
-        {
-          role: "assistant",
-          content: {
-            type: "text",
-            text: `When reading Figma designs, follow these best practices:
-
-1. Start with selection:
-   - First use read_my_design() to understand the current selection
-   - If no selection ask user to select single or multiple nodes
-`
-          }
-        }
-      ],
-      description: "Best practices for reading Figma designs"
-    };
-  }
-);
-server.tool(
+figmaTool(
   "scan_text_nodes",
   "Scan all text nodes in the selected Figma node",
   {
@@ -1301,7 +1535,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "scan_nodes_by_types",
   "Scan for child nodes with specific types in the selected Figma node",
   {
@@ -1356,7 +1590,7 @@ server.tool(
     }
   }
 );
-server.prompt(
+figmaPrompt(
   "text_replacement_strategy",
   "Systematic approach for replacing text in Figma designs",
   (extra) => {
@@ -1488,7 +1722,7 @@ Remember that text is never just text\u2014it's a core design element that must 
     };
   }
 );
-server.tool(
+figmaTool(
   "set_multiple_text_contents",
   "Set multiple text contents parallelly in a node",
   {
@@ -1562,7 +1796,7 @@ ${failedResults.map(
     }
   }
 );
-server.prompt(
+figmaPrompt(
   "annotation_conversion_strategy",
   "Strategy for converting manual annotations to Figma's native annotations",
   (extra) => {
@@ -1717,7 +1951,7 @@ This strategy focuses on practical implementation based on real-world usage patt
     };
   }
 );
-server.prompt(
+figmaPrompt(
   "swap_overrides_instances",
   "Guide to swap instance overrides between instances",
   (extra) => {
@@ -1771,7 +2005,7 @@ This strategy enables transferring content and property overrides from a source 
     };
   }
 );
-server.tool(
+figmaTool(
   "set_layout_mode",
   "Set the layout mode and wrap behavior of a frame in Figma",
   {
@@ -1807,7 +2041,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "set_padding",
   "Set padding values for an auto-layout frame in Figma",
   {
@@ -1853,7 +2087,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "set_axis_align",
   "Set primary and counter axis alignment for an auto-layout frame in Figma",
   {
@@ -1893,7 +2127,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "set_layout_sizing",
   "Set horizontal and vertical sizing modes for an auto-layout frame in Figma",
   {
@@ -1933,7 +2167,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "set_item_spacing",
   "Set distance between children in an auto-layout frame",
   {
@@ -1971,44 +2205,7 @@ server.tool(
     }
   }
 );
-server.tool(
-  "get_reactions",
-  "Get Figma Prototyping Reactions from multiple nodes. CRITICAL: The output MUST be processed using the 'reaction_to_connector_strategy' prompt IMMEDIATELY to generate parameters for connector lines via the 'create_connections' tool.",
-  {
-    nodeIds: import_zod.z.array(import_zod.z.string()).describe("Array of node IDs to get reactions from")
-  },
-  async ({ nodeIds }) => {
-    try {
-      const result = await sendCommandToFigma("get_reactions", { nodeIds });
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result)
-          },
-          {
-            type: "text",
-            text: "IMPORTANT: You MUST now use the reaction data above and follow the `reaction_to_connector_strategy` prompt to prepare the parameters for the `create_connections` tool call. This is a required next step."
-          }
-        ],
-        followUp: {
-          type: "prompt",
-          prompt: "reaction_to_connector_strategy"
-        }
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error getting reactions: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ]
-      };
-    }
-  }
-);
-server.tool(
+figmaTool(
   "set_default_connector",
   "Set a copied connector node as the default connector",
   {
@@ -2039,7 +2236,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "create_connections",
   "Create connections between nodes using the default connector style",
   {
@@ -2084,7 +2281,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "set_focus",
   "Set focus on a specific node in Figma by selecting it and scrolling viewport to it",
   {
@@ -2114,7 +2311,7 @@ server.tool(
     }
   }
 );
-server.tool(
+figmaTool(
   "set_selections",
   "Set selection to multiple nodes in Figma and scroll viewport to show them",
   {
@@ -2144,89 +2341,7 @@ server.tool(
     }
   }
 );
-server.prompt(
-  "reaction_to_connector_strategy",
-  "Strategy for converting Figma prototype reactions to connector lines using the output of 'get_reactions'",
-  (extra) => {
-    return {
-      messages: [
-        {
-          role: "assistant",
-          content: {
-            type: "text",
-            text: `# Strategy: Convert Figma Prototype Reactions to Connector Lines
-
-## Goal
-Process the JSON output from the \`get_reactions\` tool to generate an array of connection objects suitable for the \`create_connections\` tool. This visually represents prototype flows as connector lines on the Figma canvas.
-
-## Input Data
-You will receive JSON data from the \`get_reactions\` tool. This data contains an array of nodes, each with potential reactions. A typical reaction object looks like this:
-\`\`\`json
-{
-  "trigger": { "type": "ON_CLICK" },
-  "action": {
-    "type": "NAVIGATE",
-    "destinationId": "destination-node-id",
-    "navigationTransition": { ... },
-    "preserveScrollPosition": false
-  }
-}
-\`\`\`
-
-## Step-by-Step Process
-
-### 1. Preparation & Context Gathering
-   - **Action:** Call \`read_my_design\` on the relevant node(s) to get context about the nodes involved (names, types, etc.). This helps in generating meaningful connector labels later.
-   - **Action:** Call \`set_default_connector\` **without** the \`connectorId\` parameter.
-   - **Check Result:** Analyze the response from \`set_default_connector\`.
-     - If it confirms a default connector is already set (e.g., "Default connector is already set"), proceed to Step 2.
-     - If it indicates no default connector is set (e.g., "No default connector set..."), you **cannot** proceed with \`create_connections\` yet. Inform the user they need to manually copy a connector from FigJam, paste it onto the current page, select it, and then you can run \`set_default_connector({ connectorId: "SELECTED_NODE_ID" })\` before attempting \`create_connections\`. **Do not proceed to Step 2 until a default connector is confirmed.**
-
-### 2. Filter and Transform Reactions from \`get_reactions\` Output
-   - **Iterate:** Go through the JSON array provided by \`get_reactions\`. For each node in the array:
-     - Iterate through its \`reactions\` array.
-   - **Filter:** Keep only reactions where the \`action\` meets these criteria:
-     - Has a \`type\` that implies a connection (e.g., \`NAVIGATE\`, \`OPEN_OVERLAY\`, \`SWAP_OVERLAY\`). **Ignore** types like \`CHANGE_TO\`, \`CLOSE_OVERLAY\`, etc.
-     - Has a valid \`destinationId\` property.
-   - **Extract:** For each valid reaction, extract the following information:
-     - \`sourceNodeId\`: The ID of the node the reaction belongs to (from the outer loop).
-     - \`destinationNodeId\`: The value of \`action.destinationId\`.
-     - \`actionType\`: The value of \`action.type\`.
-     - \`triggerType\`: The value of \`trigger.type\`.
-
-### 3. Generate Connector Text Labels
-   - **For each extracted connection:** Create a concise, descriptive text label string.
-   - **Combine Information:** Use the \`actionType\`, \`triggerType\`, and potentially the names of the source/destination nodes (obtained from Step 1's \`read_my_design\` or by calling \`get_node_info\` if necessary) to generate the label.
-   - **Example Labels:**
-     - If \`triggerType\` is "ON_CLICK" and \`actionType\` is "NAVIGATE": "On click, navigate to [Destination Node Name]"
-     - If \`triggerType\` is "ON_DRAG" and \`actionType\` is "OPEN_OVERLAY": "On drag, open [Destination Node Name] overlay"
-   - **Keep it brief and informative.** Let this generated string be \`generatedText\`.
-
-### 4. Prepare the \`connections\` Array for \`create_connections\`
-   - **Structure:** Create a JSON array where each element is an object representing a connection.
-   - **Format:** Each object in the array must have the following structure:
-     \`\`\`json
-     {
-       "startNodeId": "sourceNodeId_from_step_2",
-       "endNodeId": "destinationNodeId_from_step_2",
-       "text": "generatedText_from_step_3"
-     }
-     \`\`\`
-   - **Result:** This final array is the value you will pass to the \`connections\` parameter when calling the \`create_connections\` tool.
-
-### 5. Execute Connection Creation
-   - **Action:** Call the \`create_connections\` tool, passing the array generated in Step 4 as the \`connections\` argument.
-   - **Verify:** Check the response from \`create_connections\` to confirm success or failure.
-
-This detailed process ensures you correctly interpret the reaction data, prepare the necessary information, and use the appropriate tools to create the connector lines.`
-          }
-        }
-      ],
-      description: "Strategy for converting Figma prototype reactions to connector lines using the output of 'get_reactions'"
-    };
-  }
-);
-function connectToFigma(port = 3055) {
+function connectToFigma(port = FIGMA_SOCKET_PORT) {
   if (ws && ws.readyState === import_ws.default.OPEN) {
     logger.info("Already connected to Figma");
     return;
@@ -2237,10 +2352,18 @@ function connectToFigma(port = 3055) {
   ws.on("open", () => {
     logger.info("Connected to Figma socket server");
     currentChannel = null;
+    currentChannelDescription = null;
   });
   ws.on("message", (data) => {
     try {
       const json = JSON.parse(data);
+      if (json.type === "channel_list" && typeof json.id === "string" && pendingRequests.has(json.id)) {
+        const request = pendingRequests.get(json.id);
+        clearTimeout(request.timeout);
+        pendingRequests.delete(json.id);
+        request.resolve(Array.isArray(json.channels) ? json.channels : []);
+        return;
+      }
       if (json.type === "progress_update") {
         const progressData = json.message.data;
         const requestId = json.id || "";
@@ -2295,17 +2418,49 @@ function connectToFigma(port = 3055) {
       request.reject(new Error("Connection closed"));
       pendingRequests.delete(id);
     }
-    logger.info("Attempting to reconnect in 2 seconds...");
-    setTimeout(() => connectToFigma(port), 2e3);
+    if (!CLI_EXPORT_PNG_MODE) {
+      logger.info("Attempting to reconnect in 2 seconds...");
+      setTimeout(() => connectToFigma(port), 2e3);
+    }
   });
 }
-async function joinChannel(channelName) {
+function listActiveRelayChannels(timeoutMs = 1e4) {
+  return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== import_ws.default.OPEN) {
+      connectToFigma();
+      reject(new Error("Not connected to Figma relay. Attempting to connect..."));
+      return;
+    }
+    const id = (0, import_uuid.v4)();
+    const timeout = setTimeout(() => {
+      if (pendingRequests.has(id)) {
+        pendingRequests.delete(id);
+        reject(new Error("Request to list active channels timed out"));
+      }
+    }, timeoutMs);
+    pendingRequests.set(id, {
+      resolve: (value) => {
+        resolve(value);
+      },
+      reject,
+      timeout,
+      lastActivity: Date.now()
+    });
+    ws.send(JSON.stringify({ type: "list_channels", id }));
+    logger.info("Sent list_channels to relay");
+  });
+}
+async function joinChannel(channelName, channelDescription) {
   if (!ws || ws.readyState !== import_ws.default.OPEN) {
     throw new Error("Not connected to Figma");
   }
   try {
-    await sendCommandToFigma("join", { channel: channelName });
+    await sendCommandToFigma("join", {
+      channel: channelName,
+      channel_description: channelDescription
+    });
     currentChannel = channelName;
+    currentChannelDescription = channelDescription?.trim() || null;
     logger.info(`Joined channel: ${channelName}`);
   } catch (error) {
     logger.error(`Failed to join channel: ${error instanceof Error ? error.message : String(error)}`);
@@ -2357,34 +2512,55 @@ function sendCommandToFigma(command, params = {}, timeoutMs = 3e4) {
     ws.send(JSON.stringify(request));
   });
 }
-server.tool(
-  "join_channel",
-  "Join a specific channel to communicate with Figma",
-  {
-    channel: import_zod.z.string().describe("The name of the channel to join").default("")
-  },
-  async ({ channel }) => {
+figmaTool(
+  "get_active_channels",
+  "List WebSocket relay channels that currently have at least one connected client. Use after reconnecting or when the channel name is unknown, then call join_channel with a channel name from this list.",
+  {},
+  async () => {
     try {
-      if (!channel) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Please provide a channel name to join:"
-            }
-          ],
-          followUp: {
-            tool: "join_channel",
-            description: "Join the specified channel"
-          }
-        };
-      }
-      await joinChannel(channel);
+      const channels = await listActiveRelayChannels();
+      const lines = channels.length === 0 ? "No active channels (no clients connected to the relay, or relay unreachable)." : [
+        "Active relay channels (name, connected client count, and optional description):",
+        ...channels.map(
+          (c) => `  - ${c.name} (${c.clientCount} client(s))${c.description ? ` - ${c.description}` : ""}`
+        ),
+        "",
+        "Call join_channel with one of the names above to pair with Figma on that channel."
+      ].join("\n");
+      return {
+        content: [{ type: "text", text: lines }]
+      };
+    } catch (error) {
       return {
         content: [
           {
             type: "text",
-            text: `Successfully joined channel: ${channel}`
+            text: `Error listing active channels: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ]
+      };
+    }
+  }
+);
+figmaTool(
+  "join_channel",
+  "Join a specific channel to communicate with Figma",
+  {
+    channel: import_zod.z.string().describe("The channel to join").optional(),
+    channel_description: import_zod.z.string().describe("Human-readable context for the channel").optional()
+  },
+  async ({ channel, channel_description }) => {
+    try {
+      const normalizedChannel = typeof channel === "string" ? channel.trim() : "";
+      const normalizedDescription = typeof channel_description === "string" ? channel_description.trim() : "";
+      const resolvedChannel = normalizedChannel || generateRandomChannelName();
+      await joinChannel(resolvedChannel, normalizedDescription || void 0);
+      const descriptionSuffix = normalizedDescription ? ` (description: ${normalizedDescription})` : "";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Successfully joined channel: ${resolvedChannel}${descriptionSuffix}`
           }
         ]
       };
@@ -2400,7 +2576,83 @@ server.tool(
     }
   }
 );
+function generateRandomChannelName(length = 8) {
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let result = "";
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+function waitUntilWebSocketOpen(timeoutMs) {
+  return new Promise((resolve, reject) => {
+    if (ws?.readyState === import_ws.default.OPEN) {
+      resolve();
+      return;
+    }
+    if (!ws) {
+      reject(new Error("WebSocket not initialized"));
+      return;
+    }
+    const t = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timeout (${timeoutMs}ms) waiting for WebSocket connection`));
+    }, timeoutMs);
+    const onOpen = () => {
+      cleanup();
+      resolve();
+    };
+    const onErr = (err) => {
+      cleanup();
+      reject(err);
+    };
+    function cleanup() {
+      clearTimeout(t);
+      ws?.off("open", onOpen);
+      ws?.off("error", onErr);
+    }
+    ws.once("open", onOpen);
+    ws.once("error", onErr);
+  });
+}
+async function runExportPngCli(opts) {
+  connectToFigma(FIGMA_SOCKET_PORT);
+  await waitUntilWebSocketOpen(3e4);
+  await joinChannel(opts.channel);
+  await new Promise((r) => setTimeout(r, 400));
+  const result = await sendCommandToFigma(
+    "export_node_as_image",
+    {
+      nodeId: opts.nodeId,
+      format: "PNG",
+      scale: opts.scale
+    },
+    45e3
+  );
+  const b64 = result?.imageData;
+  if (!b64 || typeof b64 !== "string") {
+    throw new Error("export_node_as_image returned no imageData");
+  }
+  const abs = resolveWritePathUnderCwd(opts.outRel);
+  const buf = Buffer.from(b64, "base64");
+  import_node_fs.default.mkdirSync(import_node_path.default.dirname(abs), { recursive: true });
+  import_node_fs.default.writeFileSync(abs, buf);
+  const rel = import_node_path.default.relative(process.cwd(), abs);
+  logger.info(`Wrote ${rel} (${buf.byteLength} bytes)`);
+}
 async function main() {
+  if (EXPORT_PNG_CLI) {
+    try {
+      await runExportPngCli(EXPORT_PNG_CLI);
+      process.exit(0);
+    } catch (error) {
+      logger.error(
+        `export-png CLI failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+      process.exit(1);
+    }
+    return;
+  }
   try {
     connectToFigma();
   } catch (error) {
@@ -2410,6 +2662,11 @@ async function main() {
   const transport = new import_stdio.StdioServerTransport();
   await server.connect(transport);
   logger.info("FigmaMCP server running on stdio");
+  if (CLIENT_CONNECTION_MODE === "read-only") {
+    logger.info(
+      "Connection mode: read-only (mutation tools and write-focused prompts omitted)"
+    );
+  }
 }
 main().catch((error) => {
   logger.error(`Error starting FigmaMCP server: ${error instanceof Error ? error.message : String(error)}`);

@@ -257,14 +257,13 @@
     <div class="container">
       <div class="header">
         <div class="header-text">
-          <h1>Talk To Figma MCP Plugin</h1>
-          <p>Connect Figma to Cursor AI using MCP</p>
+          <h1>Figma MCP Plugin</h1>
+          <p>Connect Figma to using MCP</p>
         </div>
       </div>
 
       <div class="tabs">
-        <div id="tab-connection" class="tab active">Connection</div>
-        <div id="tab-about" class="tab">About</div>
+        <div id="tab-connection" class="tab active">Connection</div>        
       </div>
 
       <div id="content-connection" class="tab-content active">
@@ -286,35 +285,22 @@
               max="65535"
             />
           </div>
+
+          <div id="channel-description-container">
+            <label for="channel-description">Channel Description (optional)</label>
+            <input
+              type="text"
+              id="channel-description"
+              placeholder="e.g. checkout flow redesign"
+            />
+          </div>
         </div>
 
         <div id="connection-status" class="status disconnected">
           Not connected to Cursor MCP server
         </div>
 
-        <div id="mcp-config" class="section hidden">
-          <h2>MCP Configuration</h2>
-          <p>
-            Copy this configuration to your <code>mcp.json</code> file in
-            Cursor:
-          </p>
-          <textarea
-            id="mcp-json"
-            rows="5"
-            readonly
-            style="
-              width: 100%;
-              background: #2d2d2d;
-              color: #e0e0e0;
-              padding: 12px;
-              border: 1px solid #444444;
-              border-radius: 4px;
-              font-family: monospace;
-              margin-bottom: 8px;
-            "
-          ></textarea>
-          <button id="btn-copy" class="secondary">Copy to Clipboard</button>
-        </div>
+        <div id="mcp-config" class="section hidden"></div>
 
         <!-- Add Progress Bar Section -->
         <div id="progress-container" class="section hidden">
@@ -351,30 +337,7 @@
             <div id="progress-percentage">0%</div>
           </div>
         </div>
-      </div>
-
-      <div id="content-about" class="tab-content">
-        <div class="section">
-          <h2>About Talk To Figma Plugin</h2>
-          <p>
-            This plugin allows Cursor AI to communicate with Figma, enabling
-            AI-assisted design operations.
-            <a
-              class="link"
-              onclick="window.open(`https://github.com/grab/cursor-talk-to-figma-mcp`, '_blank')"
-              >Github</a
-            >
-          </p>
-          <p>Version: 1.1.0</p>
-
-          <h2>How to Use</h2>
-          <ol>
-            <li>Make sure the MCP server is running in Cursor</li>
-            <li>Connect to the server using the port number (default: 3055)</li>
-            <li>Once connected, you can interact with Figma through Cursor</li>
-          </ol>
-        </div>
-      </div>
+      </div>      
     </div>
 
     <script>
@@ -385,10 +348,14 @@
         serverPort: 3055,
         pendingRequests: new Map(),
         channel: null,
+        channelDescription: "",
       };
 
       // UI Elements
       const portInput = document.getElementById("port");
+      const channelDescriptionInput = document.getElementById(
+        "channel-description"
+      );
       const connectButton = document.getElementById("btn-connect");
       const connectionStatus = document.getElementById("connection-status");
 
@@ -413,11 +380,6 @@
             ? "Connected to Cursor MCP server"
             : "Not connected to Cursor MCP server");
 
-        // Add instructions for localhost when disconnected
-        if (!isConnected) {
-          statusMessage += `<br><br>Run this in your terminal, then connect<br><code>bunx cursor-talk-to-figma-socket</code>`;
-        }
-
         connectionStatus.innerHTML = statusMessage;
         connectionStatus.className = `status ${
           isConnected ? "connected" : "disconnected"
@@ -427,6 +389,7 @@
         connectButton.textContent = isConnected ? "Disconnect" : "Connect";
         connectButton.className = isConnected ? "secondary" : "primary";
         portInput.disabled = isConnected;
+        channelDescriptionInput.disabled = isConnected;
 
         // Show/hide MCP config section
         const mcpConfig = document.getElementById("mcp-config");
@@ -439,7 +402,7 @@
       }
 
       // Connect to WebSocket server
-      async function connectToServer(port) {
+      async function connectToServer(port, requestedChannelDescription = "") {
         try {
           if (state.connected && state.socket) {
             updateConnectionStatus(true, "Already connected to server");
@@ -447,13 +410,19 @@
           }
 
           state.serverPort = port;
+          state.channelDescription = normalizeChannelDescription(
+            requestedChannelDescription
+          );
           const wsUrl = `ws://localhost:${port}`;
 
           state.socket = new WebSocket(wsUrl);
 
           state.socket.onopen = () => {
-            // Generate random channel name
             const channelName = generateChannelName();
+            const effectiveChannelDescription = normalizeChannelDescription(
+              state.channelDescription || channelDescriptionInput.value
+            );
+            state.channelDescription = effectiveChannelDescription;
             console.log("Joining channel:", channelName);
             state.channel = channelName;
 
@@ -462,6 +431,7 @@
               JSON.stringify({
                 type: "join",
                 channel: channelName.trim(),
+                channel_description: effectiveChannelDescription || undefined,
               })
             );
           };
@@ -476,9 +446,12 @@
                 if (data.message && data.message.result) {
                   state.connected = true;
                   const channelName = data.channel;
+                  const descriptionSuffix = state.channelDescription
+                    ? ` | description: <strong>${state.channelDescription}</strong>`
+                    : "";
                   updateConnectionStatus(
                     true,
-                    `Connected to server in channel: <strong>${channelName}</strong>`
+                    `Connected to server in channel: <strong>${channelName}</strong>${descriptionSuffix}`
                   );
 
                   // Notify the plugin code
@@ -486,7 +459,7 @@
                     {
                       pluginMessage: {
                         type: "notify",
-                        message: `Connected to Cursor MCP server on port ${port} in channel: ${channelName}`,
+                        message: `Connected to Cursor MCP server on port ${port} in channel: ${channelName}${state.channelDescription ? ` (description: ${state.channelDescription})` : ""}`,
                       },
                     },
                     "*"
@@ -674,6 +647,24 @@
         return result;
       }
 
+      function normalizeChannelDescription(channelDescription) {
+        return typeof channelDescription === "string"
+          ? channelDescription.trim()
+          : "";
+      }
+
+      function setDefaultChannelDescription(description) {
+        const normalizedDescription = normalizeChannelDescription(description);
+        const currentValue = normalizeChannelDescription(
+          channelDescriptionInput.value
+        );
+        if (!normalizedDescription || currentValue) return;
+        channelDescriptionInput.value = normalizedDescription;
+        if (!state.channelDescription) {
+          state.channelDescription = normalizedDescription;
+        }
+      }
+
       // Tab switching
       tabs.forEach((tab) => {
         tab.addEventListener("click", () => {
@@ -694,9 +685,12 @@
           disconnectFromServer();
         } else {
           const port = parseInt(portInput.value, 10) || 3055;
+          const requestedChannelDescription = normalizeChannelDescription(
+            channelDescriptionInput.value
+          );
           updateConnectionStatus(false, "Connecting...");
           connectionStatus.className = "status info";
-          connectToServer(port);
+          connectToServer(port, requestedChannelDescription);
         }
       });
 
@@ -786,6 +780,9 @@
           case "auto-disconnect":
             connectButton.click();
             break;
+          case "default-channel-description":
+            setDefaultChannelDescription(message.description);
+            break;
           case "command-result":
             // Forward the result from plugin code back to WebSocket
             sendSuccessResponse(message.id, message.result);
@@ -804,16 +801,18 @@
       };
 
       // Add this to the script section, after all the other event listeners
-      document.getElementById("btn-copy").addEventListener("click", () => {
-        const textarea = document.getElementById("mcp-json");
-        textarea.select();
-        document.execCommand("copy");
-        const button = document.getElementById("btn-copy");
-        button.textContent = "Copied!";
-        setTimeout(() => {
-          button.textContent = "Copy to Clipboard";
-        }, 2000);
-      });
+      const copyButton = document.getElementById("btn-copy");
+      const mcpJsonTextarea = document.getElementById("mcp-json");
+      if (copyButton && mcpJsonTextarea) {
+        copyButton.addEventListener("click", () => {
+          mcpJsonTextarea.select();
+          document.execCommand("copy");
+          copyButton.textContent = "Copied!";
+          setTimeout(() => {
+            copyButton.textContent = "Copy to Clipboard";
+          }, 2000);
+        });
+      }
 
       // Add this function to the script section
       function updateMcpConfig() {
@@ -826,11 +825,8 @@
           },
         };
 
-        document.getElementById("mcp-json").value = JSON.stringify(
-          mcpConfig,
-          null,
-          2
-        );
+        if (!mcpJsonTextarea) return;
+        mcpJsonTextarea.value = JSON.stringify(mcpConfig, null, 2);
       }
     </script>
   </body>
