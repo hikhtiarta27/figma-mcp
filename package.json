@@ -17,6 +17,7 @@
     "socket": "bun run src/socket.ts",
     "setup": "./scripts/setup.sh",
     "build": "tsup",
+    "build:socket": "tsup src/socket.ts --format esm --outDir dist --target node18 --sourcemap --clean false",
     "build:watch": "tsup --watch",
     "dev": "bun run build:watch",
     "pub:release": "bun run build && npm publish"
