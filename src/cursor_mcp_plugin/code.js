@@ -54,22 +54,27 @@ async function sendProgressUpdate(
   return update;
 }
 
-// Show UI (modal on the canvas — not inside the Plugins sidebar)
-(function openPluginUi() {
+// Show UI (modal on the canvas — not inside the Plugins sidebar).
+// Call showUI synchronously so the iframe exists before async init; otherwise messages like
+// auto-connect can be dropped. Closing the plugin window still stops the WebSocket — keep this
+// panel open while you need MCP; channel/port are persisted so reconnects reuse the same channel.
+(function bootstrapPluginUi() {
   const html =
     typeof __html__ !== "undefined" && __html__
       ? __html__
       : '<html><body style="font:14px sans-serif;padding:16px">Cursor MCP: <code>__html__</code> is empty. Re-import the plugin from <code>manifest.json</code> (same folder as <code>ui.html</code>).</body></html>';
-  const size = { width: 350, height: 600 };
+
+  const NORMAL = { width: 350, height: 600 };
+
   try {
     figma.showUI(html, {
-      width: size.width,
-      height: size.height,
+      width: NORMAL.width,
+      height: NORMAL.height,
       title: "Talk To Figma MCP",
     });
   } catch (e) {
     try {
-      figma.showUI(html, size);
+      figma.showUI(html, NORMAL);
     } catch (e2) {
       figma.notify(
         "Cursor MCP could not open UI: " + (e2.message || String(e2))
@@ -77,6 +82,30 @@ async function sendProgressUpdate(
       throw e2;
     }
   }
+
+  (async function sendInitSettings() {
+    let saved = {};
+    try {
+      saved = (await figma.clientStorage.getAsync("settings")) || {};
+    } catch (e) {
+      console.error("Error loading plugin settings:", e);
+    }
+
+    if (saved.serverPort) {
+      state.serverPort = saved.serverPort;
+    }
+
+    figma.ui.postMessage({
+      type: "init-settings",
+      settings: {
+        serverPort: state.serverPort,
+        savedChannel: saved.mcpChannel || null,
+        channelDescription: saved.channelDescription || "",
+      },
+    });
+
+    sendDefaultChannelDescription();
+  })();
 })();
 
 function sendDefaultChannelDescription() {
@@ -91,8 +120,6 @@ function sendDefaultChannelDescription() {
   });
 }
 
-sendDefaultChannelDescription();
-
 // Plugin commands from UI
 figma.ui.onmessage = async (msg) => {
   switch (msg.type) {
@@ -104,6 +131,34 @@ figma.ui.onmessage = async (msg) => {
       break;
     case "close-plugin":
       figma.closePlugin();
+      break;
+    case "persist-connection":
+      (async () => {
+        try {
+          const cur = (await figma.clientStorage.getAsync("settings")) || {};
+          await figma.clientStorage.setAsync(
+            "settings",
+            Object.assign({}, cur, {
+              serverPort:
+                msg.serverPort != null
+                  ? msg.serverPort
+                  : cur.serverPort != null
+                    ? cur.serverPort
+                    : state.serverPort,
+              mcpChannel:
+                msg.channel != null ? msg.channel : cur.mcpChannel,
+              channelDescription:
+                msg.channelDescription != null
+                  ? msg.channelDescription
+                  : cur.channelDescription != null
+                    ? cur.channelDescription
+                    : "",
+            })
+          );
+        } catch (e) {
+          console.error("persist-connection:", e);
+        }
+      })();
       break;
     case "execute-command":
       // Execute commands received from UI (which gets them from WebSocket)
@@ -1509,28 +1564,6 @@ async function setTextContent(params) {
     throw new Error(`Error setting text content: ${error.message}`);
   }
 }
-
-// Initialize settings on load
-(async function initializePlugin() {
-  try {
-    const savedSettings = await figma.clientStorage.getAsync("settings");
-    if (savedSettings) {
-      if (savedSettings.serverPort) {
-        state.serverPort = savedSettings.serverPort;
-      }
-    }
-
-    // Send initial settings to UI
-    figma.ui.postMessage({
-      type: "init-settings",
-      settings: {
-        serverPort: state.serverPort,
-      },
-    });
-  } catch (error) {
-    console.error("Error loading settings:", error);
-  }
-})();
 
 function uniqBy(arr, predicate) {
   const cb = typeof predicate === "function" ? predicate : (o) => o[predicate];

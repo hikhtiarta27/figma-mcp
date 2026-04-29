@@ -349,6 +349,9 @@
         pendingRequests: new Map(),
         channel: null,
         channelDescription: "",
+        initDone: false,
+        pendingAutoConnect: false,
+        savedChannelFromStorage: null,
       };
 
       // UI Elements
@@ -369,6 +372,20 @@
       const progressMessage = document.getElementById("progress-message");
       const progressStatus = document.getElementById("progress-status");
       const progressPercentage = document.getElementById("progress-percentage");
+
+      function persistConnection(port) {
+        parent.postMessage(
+          {
+            pluginMessage: {
+              type: "persist-connection",
+              serverPort: port,
+              channel: state.channel,
+              channelDescription: state.channelDescription,
+            },
+          },
+          "*"
+        );
+      }
 
       // Initialize UI
       function updateConnectionStatus(isConnected, message) {
@@ -402,7 +419,11 @@
       }
 
       // Connect to WebSocket server
-      async function connectToServer(port, requestedChannelDescription = "") {
+      async function connectToServer(
+        port,
+        requestedChannelDescription = "",
+        fixedChannelName = null
+      ) {
         try {
           if (state.connected && state.socket) {
             updateConnectionStatus(true, "Already connected to server");
@@ -418,11 +439,15 @@
           state.socket = new WebSocket(wsUrl);
 
           state.socket.onopen = () => {
-            const channelName = generateChannelName();
             const effectiveChannelDescription = normalizeChannelDescription(
               state.channelDescription || channelDescriptionInput.value
             );
             state.channelDescription = effectiveChannelDescription;
+            const fromFixed =
+              fixedChannelName && String(fixedChannelName).trim()
+                ? String(fixedChannelName).trim()
+                : null;
+            const channelName = fromFixed || generateChannelName();
             console.log("Joining channel:", channelName);
             state.channel = channelName;
 
@@ -453,6 +478,8 @@
                     true,
                     `Connected to server in channel: <strong>${channelName}</strong>${descriptionSuffix}`
                   );
+
+                  persistConnection(port);
 
                   // Notify the plugin code
                   parent.postMessage(
@@ -690,7 +717,14 @@
           );
           updateConnectionStatus(false, "Connecting...");
           connectionStatus.className = "status info";
-          connectToServer(port, requestedChannelDescription);
+          const reuse =
+            state.savedChannelFromStorage ||
+            (state.channel && String(state.channel).trim());
+          connectToServer(
+            port,
+            requestedChannelDescription,
+            reuse || null
+          );
         }
       });
 
@@ -771,11 +805,36 @@
         console.log("Received message from plugin:", message);
 
         switch (message.type) {
+          case "init-settings": {
+            const s = message.settings || {};
+            state.initDone = true;
+            if (s.serverPort) {
+              portInput.value = String(s.serverPort);
+              state.serverPort = s.serverPort;
+            }
+            state.savedChannelFromStorage = s.savedChannel || null;
+            if (
+              typeof s.channelDescription === "string" &&
+              s.channelDescription &&
+              !normalizeChannelDescription(channelDescriptionInput.value)
+            ) {
+              channelDescriptionInput.value = s.channelDescription;
+            }
+            if (state.pendingAutoConnect) {
+              state.pendingAutoConnect = false;
+              connectButton.click();
+            }
+            break;
+          }
           case "connection-status":
             updateConnectionStatus(message.connected, message.message);
             break;
           case "auto-connect":
-            connectButton.click();
+            if (!state.initDone) {
+              state.pendingAutoConnect = true;
+            } else {
+              connectButton.click();
+            }
             break;
           case "auto-disconnect":
             connectButton.click();
