@@ -3035,9 +3035,25 @@ function connectToFigma(port: number = FIGMA_SOCKET_PORT) {
 
   ws.on('open', () => {
     logger.info('Connected to Figma socket server');
-    // Reset channel on new connection
-    currentChannel = null;
-    currentChannelDescription = null;
+    // After a relay drop, the MCP client gets a new WebSocket but must join the relay again.
+    // Keep currentChannel in memory across disconnect; re-join so Cursor does not stay "orphaned"
+    // until the user runs join_channel again (previously felt like a multi-second dead connection).
+    const savedChannel = currentChannel;
+    const savedDescription = currentChannelDescription;
+    if (savedChannel) {
+      void (async () => {
+        try {
+          await joinChannel(savedChannel, savedDescription || undefined);
+          logger.info(`Re-joined relay channel "${savedChannel}" after reconnect`);
+        } catch (err) {
+          logger.error(
+            `Failed to re-join channel after reconnect: ${err instanceof Error ? err.message : String(err)}`
+          );
+          currentChannel = null;
+          currentChannelDescription = null;
+        }
+      })();
+    }
   });
 
   ws.on("message", (data: any) => {

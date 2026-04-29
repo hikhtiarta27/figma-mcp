@@ -352,6 +352,10 @@
         initDone: false,
         pendingAutoConnect: false,
         savedChannelFromStorage: null,
+        /** True when user clicked Disconnect — do not auto-reconnect on socket close */
+        manualDisconnect: false,
+        reconnectTimer: null,
+        reconnectAttempts: 0,
       };
 
       // UI Elements
@@ -430,6 +434,11 @@
             return;
           }
 
+          if (state.reconnectTimer) {
+            clearTimeout(state.reconnectTimer);
+            state.reconnectTimer = null;
+          }
+
           state.serverPort = port;
           state.channelDescription = normalizeChannelDescription(
             requestedChannelDescription
@@ -479,6 +488,8 @@
                     `Connected to server in channel: <strong>${channelName}</strong>${descriptionSuffix}`
                   );
 
+                  state.reconnectAttempts = 0;
+
                   persistConnection(port);
 
                   // Notify the plugin code
@@ -504,17 +515,45 @@
             }
           };
 
-          state.socket.onclose = () => {
+          state.socket.onclose = function () {
+            var port = state.serverPort;
+            var desc = state.channelDescription;
+            var fixed = state.channel;
+            var wasManual = state.manualDisconnect;
+
             state.connected = false;
             state.socket = null;
-            updateConnectionStatus(false, "Disconnected from server");
+
+            if (wasManual) {
+              updateConnectionStatus(false, "Disconnected from server");
+              return;
+            }
+
+            if (fixed && port && state.reconnectAttempts < 25) {
+              state.reconnectAttempts += 1;
+              updateConnectionStatus(
+                false,
+                "Disconnected from relay — reconnecting in 2s (attempt " +
+                  state.reconnectAttempts +
+                  "/25)…"
+              );
+              connectionStatus.className = "status info";
+              state.reconnectTimer = setTimeout(function () {
+                state.reconnectTimer = null;
+                connectToServer(port, desc || "", fixed || null);
+              }, 2000);
+            } else if (state.reconnectAttempts >= 25) {
+              updateConnectionStatus(
+                false,
+                "Disconnected — auto-reconnect stopped. Click Connect to retry."
+              );
+            } else {
+              updateConnectionStatus(false, "Disconnected from server");
+            }
           };
 
-          state.socket.onerror = (error) => {
+          state.socket.onerror = function (error) {
             console.error("WebSocket error:", error);
-            updateConnectionStatus(false, "Connection error");
-            state.connected = false;
-            state.socket = null;
           };
         } catch (error) {
           console.error("Connection error:", error);
@@ -527,12 +566,18 @@
 
       // Disconnect from websocket server
       function disconnectFromServer() {
+        state.manualDisconnect = true;
+        state.reconnectAttempts = 0;
+        if (state.reconnectTimer) {
+          clearTimeout(state.reconnectTimer);
+          state.reconnectTimer = null;
+        }
         if (state.socket) {
           state.socket.close();
           state.socket = null;
-          state.connected = false;
-          updateConnectionStatus(false, "Disconnected from server");
         }
+        state.connected = false;
+        updateConnectionStatus(false, "Disconnected from server");
       }
 
       // Handle messages from the WebSocket
@@ -711,6 +756,8 @@
           connectionStatus.className = "status info";
           disconnectFromServer();
         } else {
+          state.manualDisconnect = false;
+          state.reconnectAttempts = 0;
           const port = parseInt(portInput.value, 10) || 3055;
           const requestedChannelDescription = normalizeChannelDescription(
             channelDescriptionInput.value

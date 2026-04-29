@@ -408,6 +408,14 @@ function filterFigmaNode(node) {
     type: node.type,
   };
 
+  // Structure vs paint: layers can exist in the tree but be invisible (or faded).
+  if ("visible" in node && typeof node.visible === "boolean") {
+    filtered.visible = node.visible;
+  }
+  if (typeof node.opacity === "number") {
+    filtered.opacity = node.opacity;
+  }
+
   if (node.fills && node.fills.length > 0) {
     filtered.fills = node.fills.map((fill) => {
       var processedFill = Object.assign({}, fill);
