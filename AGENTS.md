@@ -36,7 +36,7 @@ Runs inside Figma. `code.js` is the plugin main thread handling 30+ commands via
 
 ## Key Patterns
 
-- **Icon / illustration export (SVG vs PNG)**: Try **`export_node_as_svg`** first (optional **`writePath`** to save a `.svg` file). **Use `.svg`** only if the subtree has **fewer than 3** vector primitives (`VECTOR`, `ELLIPSE`, `STAR`, `LINE`, `POLYGON`, `BOOLEAN_OPERATION`) **and** the decoded SVG is **≤ 8 KB** UTF-8. Otherwise use **`export_node_as_image`** **`format: "PNG"`** (e.g. `scale: 2`–`4`), optional **`writePath`**, or the **`--export-png`** CLI on the MCP binary (same args as the old script; quote node ids with `;` in the shell).
+- **Icon / illustration export (SVG vs PNG)**: Try **`export_node_as_svg`** first (optional **`writePath`** + **`outputDir`** to save a `.svg` file). **Use `.svg`** only if the subtree has **fewer than 3** vector primitives (`VECTOR`, `ELLIPSE`, `STAR`, `LINE`, `POLYGON`, `BOOLEAN_OPERATION`) **and** the decoded SVG is **≤ 8 KB** UTF-8. Otherwise use **`export_node_as_image`** (e.g. `scale: 2`–`4`) with **`writePath`** / **`outputDir`**. **`outputDir`** accepts an absolute path or a path relative to the MCP server cwd so assets land in the project (e.g. `/path/to/project/assets`) instead of the server’s default cwd.
 - **Colors**: Figma uses RGBA 0-1 range. The MCP tools accept 0-1 floats and the filter converts to hex for display.
 - **Logging**: All logs go to stderr. Stdout is reserved for MCP protocol messages.
 - **Timeouts**: 30s default per command. Progress updates from the plugin reset the inactivity timer.
@@ -73,6 +73,7 @@ claude mcp add TalkToFigma -- bunx cursor-talk-to-figma-mcp@latest
 ## Agent Notes
 
 - For static HTML from Figma: **SVG** only if **< 3** vector primitives in the export subtree **and** SVG **≤ 8 KB**; else **PNG** (`export_node_as_image` or `--export-png` CLI). See `.cursor/commands/implement-design.md` §4.
+- **Do not emit HTML elements** for nodes where `absoluteRenderBounds` is `null` (unpainted on canvas). `get_node_info` already omits these from the returned tree.
 - Always call `join_channel` before issuing any Figma commands
 - Call `get_document_info` first to understand the design structure
 - Use `read_my_design` or `get_selection` before making modifications

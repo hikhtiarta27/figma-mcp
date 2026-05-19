@@ -8,3036 +8,427 @@ import { z } from "zod";
 import WebSocket from "ws";
 import { v4 as uuidv4 } from "uuid";
 
-// Define TypeScript interfaces for Figma responses
 interface FigmaResponse {
   id: string;
-  result?: any;
+  result?: unknown;
   error?: string;
 }
 
-// Define interface for command progress updates
 interface CommandProgressUpdate {
-  type: 'command_progress';
+  type: "command_progress";
   commandId: string;
   commandType: string;
-  status: 'started' | 'in_progress' | 'completed' | 'error';
+  status: "started" | "in_progress" | "completed" | "error";
   progress: number;
   totalItems: number;
   processedItems: number;
-  currentChunk?: number;
-  totalChunks?: number;
-  chunkSize?: number;
   message: string;
-  payload?: any;
+  payload?: unknown;
   timestamp: number;
 }
 
-// Update the getInstanceOverridesResult interface to match the plugin implementation
-interface getInstanceOverridesResult {
-  success: boolean;
-  message: string;
-  sourceInstanceId: string;
-  mainComponentId: string;
-  overridesCount: number;
+interface RelayChannel {
+  name: string;
+  clientCount: number;
+  description?: string;
 }
 
-interface setInstanceOverridesResult {
-  success: boolean;
-  message: string;
-  totalCount?: number;
-  results?: Array<{
-    success: boolean;
-    instanceId: string;
-    instanceName: string;
-    appliedCount?: number;
-    message?: string;
-  }>;
-}
-
-/** Decode plugin export base64; verify SVG vs raster so we never UTF-8-decode PNG as “SVG”. */
-function decodeBase64ExportAsSvg(imageDataBase64: string):
-  | { ok: true; svg: string }
-  | { ok: false; kind: "png" | "jpeg" | "pdf" | "unknown" } {
-  const buf = Buffer.from(imageDataBase64, "base64");
-  if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
-    return { ok: false, kind: "png" };
-  }
-  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
-    return { ok: false, kind: "jpeg" };
-  }
-  const asciiHead = buf.subarray(0, Math.min(8, buf.length)).toString("ascii");
-  if (asciiHead.startsWith("%PDF")) {
-    return { ok: false, kind: "pdf" };
-  }
-  const svg = buf.toString("utf-8").trimStart();
-  if (!svg.startsWith("<")) {
-    return { ok: false, kind: "unknown" };
-  }
-  return { ok: true, svg };
-}
-
-/** Resolve a relative path under process.cwd(); reject escapes. */
-function resolveWritePathUnderCwd(rel: string): string {
-  const root = path.resolve(process.cwd());
-  const targetAbs = path.resolve(root, rel);
-  const relToRoot = path.relative(root, targetAbs);
-  if (relToRoot.startsWith("..") || path.isAbsolute(relToRoot)) {
-    throw new Error(`writePath must stay under server cwd: ${rel}`);
-  }
-  return targetAbs;
-}
-
-/** Validate Figma export payload as SVG text (not a mistaken PNG/JPEG/PDF). */
-function parsePluginSvgExport(
-  imageDataBase64: string,
-  nodeId: string
-):
-  | { ok: true; svg: string }
-  | { ok: false; kind: "png" | "jpeg" | "pdf" | "unknown"; message: string } {
-  const decoded = decodeBase64ExportAsSvg(imageDataBase64);
-  if (decoded.ok === false) {
-    const kind = decoded.kind;
-    const hint =
-      kind === "png"
-        ? "The Figma plugin returned PNG (SVG was requested). Reload the dev plugin from this repo (src/cursor_mcp_plugin) so export_node_as_image uses format SVG in exportAsync."
-        : "The export payload was not valid SVG text.";
-    return {
-      ok: false,
-      kind,
-      message: `${hint}\n\nnodeId: ${nodeId}\ndetected: ${kind}`,
-    };
-  }
-  return { ok: true, svg: decoded.svg };
-}
-
-function writeSvgUtf8UnderCwd(relPath: string, svg: string): { rel: string; bytes: number } {
-  const abs = resolveWritePathUnderCwd(relPath);
-  fs.mkdirSync(path.dirname(abs), { recursive: true });
-  fs.writeFileSync(abs, svg, "utf-8");
-  return {
-    rel: path.relative(process.cwd(), abs),
-    bytes: Buffer.byteLength(svg, "utf-8"),
-  };
-}
-
-type SvgExportContentPart =
-  | { type: "text"; text: string }
-  | { type: "image"; data: string; mimeType: string };
-
-/** Shared MCP response for a validated SVG export (optional file + text + preview). */
-function mcpContentForSvgExport(args: {
-  nodeId: string;
-  imageDataBase64: string;
-  mimeType: string;
-  svg: string;
-  writePath?: string;
-  /** When true, wording matches export_node_as_image (clipboard / HTML hints). */
-  fromImageTool: boolean;
-}): { content: SvgExportContentPart[] } {
-  const content: SvgExportContentPart[] = [];
-  if (args.writePath) {
-    const w = writeSvgUtf8UnderCwd(args.writePath, args.svg);
-    content.push({
-      type: "text",
-      text: `Wrote ${w.rel} (${w.bytes} bytes, UTF-8).`,
-    });
-  }
-  const intro = args.fromImageTool
-    ? args.writePath
-      ? `SVG export for node ${args.nodeId} (file written; XML below for clipboard, a .svg file, or inline HTML).\n\n`
-      : `SVG export for node ${args.nodeId}. Use the XML below in a .svg file, clipboard, or inline in HTML.\n\n`
-    : args.writePath
-      ? `SVG export for node ${args.nodeId} (file written; full markup below).\n\n`
-      : `SVG export for node ${args.nodeId}.\n\n`;
-  content.push({ type: "text", text: intro + args.svg });
-  content.push({
-    type: "image",
-    data: args.imageDataBase64,
-    mimeType: args.mimeType || "image/svg+xml",
-  });
-  return { content };
-}
-
-// Custom logging functions that write to stderr instead of stdout to avoid being captured
 const logger = {
   info: (message: string) => process.stderr.write(`[INFO] ${message}\n`),
   debug: (message: string) => process.stderr.write(`[DEBUG] ${message}\n`),
   warn: (message: string) => process.stderr.write(`[WARN] ${message}\n`),
   error: (message: string) => process.stderr.write(`[ERROR] ${message}\n`),
-  log: (message: string) => process.stderr.write(`[LOG] ${message}\n`)
+  log: (message: string) => process.stderr.write(`[LOG] ${message}\n`),
 };
 
-// WebSocket connection and request tracking
-let ws: WebSocket | null = null;
-const pendingRequests = new Map<string, {
-  resolve: (value: unknown) => void;
-  reject: (reason: unknown) => void;
-  timeout: ReturnType<typeof setTimeout>;
-  lastActivity: number; // Add timestamp for last activity
-}>();
-
-// Track which channel each client is in
-let currentChannel: string | null = null;
-let currentChannelDescription: string | null = null;
-
-// Create MCP server
-const server = new McpServer({
-  name: "TalkToFigmaMCP",
-  version: "1.0.0",
-});
-
-// Add command line argument parsing
-const args = process.argv.slice(2);
-const serverArg = args.find(arg => arg.startsWith('--server='));
-const serverUrl = serverArg ? serverArg.split('=')[1] : 'localhost';
-const WS_URL = serverUrl === 'localhost' ? `ws://${serverUrl}` : `wss://${serverUrl}`;
-
-const socketPortArg = args.find((a) => a.startsWith("--port="));
-const FIGMA_SOCKET_PORT = (() => {
-  const n = socketPortArg ? Number(socketPortArg.split("=", 2)[1]) : Number(process.env.PORT || "3055");
-  return Number.isFinite(n) && n > 0 ? n : 3055;
-})();
-
-function cliArgValue(argv: string[], prefix: string): string | undefined {
-  const hit = argv.find((a) => a.startsWith(prefix));
-  return hit === undefined ? undefined : hit.slice(prefix.length);
+/** Base directory for export writes. Absolute paths are used as-is; relative paths resolve from server cwd. */
+function resolveOutputBase(outputDir?: string): string {
+  if (!outputDir?.trim()) {
+    return path.resolve(process.cwd());
+  }
+  const dir = outputDir.trim();
+  return path.isAbsolute(dir) ? path.resolve(dir) : path.resolve(process.cwd(), dir);
 }
 
-/** One-shot CLI: join relay + export PNG to disk (same relay/plugin as MCP). */
-type ExportPngCliOptions = {
-  channel: string;
-  nodeId: string;
-  outRel: string;
-  scale: number;
-};
-
-function tryParseExportPngCli(argv: string[]): ExportPngCliOptions | null {
-  if (!argv.includes("--export-png")) {
-    return null;
+function resolveExportWritePath(writePath: string, outputDir?: string): string {
+  const base = resolveOutputBase(outputDir);
+  const targetAbs = path.resolve(base, writePath);
+  const relToBase = path.relative(base, targetAbs);
+  if (relToBase.startsWith("..") || path.isAbsolute(relToBase)) {
+    const scope = outputDir?.trim()
+      ? `outputDir (${base})`
+      : "server cwd";
+    throw new Error(`writePath must stay under ${scope}: ${writePath}`);
   }
-  const channel = cliArgValue(argv, "--channel=") ?? "";
-  const nodeId = cliArgValue(argv, "--node=") ?? "";
-  const outRel = cliArgValue(argv, "--out=") ?? "";
-  const scaleRaw = cliArgValue(argv, "--scale=");
-  const scale =
-    scaleRaw !== undefined && scaleRaw !== "" ? Number(scaleRaw) : 4;
-  if (!channel || !nodeId || !outRel) {
-    process.stderr.write(
-      "Usage: cursor-talk-to-figma-mcp --export-png --channel=CH --node=NODE_ID --out=relative/path.png [--scale=4] [--port=3055]\n" +
-        "Requires WebSocket relay (bun socket) and the Figma plugin on the same channel.\n"
-    );
-    process.exit(1);
-  }
-  if (!Number.isFinite(scale) || scale <= 0) {
-    process.stderr.write("Invalid --scale (expected a positive number).\n");
-    process.exit(1);
-  }
-  return { channel, nodeId, outRel, scale };
+  return targetAbs;
 }
 
-const EXPORT_PNG_CLI = tryParseExportPngCli(args);
-const CLI_EXPORT_PNG_MODE = EXPORT_PNG_CLI !== null;
-
-type ClientConnectionMode = "full" | "read-only";
-
-function parseClientConnectionMode(argv: string[]): ClientConnectionMode {
-  const modeArg = argv.find((a) => a.startsWith("--mode="));
-  const fromArg = modeArg?.split("=", 2)[1]?.trim().toLowerCase();
-  const fromEnv = process.env.MCP_MODE?.trim().toLowerCase();
-  const raw = fromArg || fromEnv || "full";
-  if (raw === "read-only" || raw === "readonly") return "read-only";
-  if (raw === "full") return "full";
-  logger.warn(
-    `Unknown connection mode "${raw}"; expected full or read-only. Defaulting to full.`
-  );
-  return "full";
-}
-
-const CLIENT_CONNECTION_MODE = parseClientConnectionMode(args);
-
-/** Tools registered in read-only mode (inspect/export/navigation only; no create/update/delete). */
-const READ_ONLY_TOOL_NAMES = new Set<string>([
-  "join_channel",
-  "get_active_channels",
-  "get_document_info",
-  "get_selection",
-  "read_my_design",
-  "get_node_info",
-  "get_nodes_info",
-  "get_annotations",
-  "scan_nodes_by_types",
-  "scan_text_nodes",
-  "get_styles",
-  "get_local_components",
-  "get_instance_overrides",
-  "export_node_as_image",
-  "export_node_as_svg",
-  "copy_node_as_svg",
-  "set_focus",
-  "set_selections",
-]);
-
-function figmaTool(...toolArgs: unknown[]): void {
-  const name = toolArgs[0] as string;
-  if (
-    CLIENT_CONNECTION_MODE === "read-only" &&
-    !READ_ONLY_TOOL_NAMES.has(name)
-  ) {
-    return;
-  }
-  (server.tool as (...args: unknown[]) => void)(...toolArgs);
-}
-
-function figmaPrompt(...promptArgs: unknown[]): void {
-  if (CLIENT_CONNECTION_MODE === "read-only") {
-    return;
-  }
-  (server.prompt as (...args: unknown[]) => void)(...promptArgs);
-}
-
-// Document Info Tool
-figmaTool(
-  "get_document_info",
-  "Get detailed information about the current Figma document",
-  {},
-  async () => {
-    try {
-      const result = await sendCommandToFigma("get_document_info");
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result)
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error getting document info: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Selection Tool
-figmaTool(
-  "get_selection",
-  "Get information about the current selection in Figma",
-  {},
-  async () => {
-    try {
-      const result = await sendCommandToFigma("get_selection");
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result)
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error getting selection: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Read My Design Tool
-figmaTool(
-  "read_my_design",
-  "Get detailed information about the current selection in Figma, including all node details",
-  {},
-  async () => {
-    try {
-      const result = await sendCommandToFigma("read_my_design", {});
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result)
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error getting node info: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Node Info Tool
-figmaTool(
-  "get_node_info",
-  "Get detailed information about a specific node in Figma",
-  {
-    nodeId: z.string().describe("The ID of the node to get information about"),
-  },
-  async ({ nodeId }: any) => {
-    try {
-      const result = await sendCommandToFigma("get_node_info", { nodeId });
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(filterFigmaNode(result))
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error getting node info: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-function rgbaToHex(color: any): string {
-  // skip if color is already hex
-  if (color.startsWith('#')) {
-    return color;
-  }
-
-  const r = Math.round(color.r * 255);
-  const g = Math.round(color.g * 255);
-  const b = Math.round(color.b * 255);
-  const a = Math.round(color.a * 255);
-
-  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}${a === 255 ? '' : a.toString(16).padStart(2, '0')}`;
-}
-
-function filterFigmaNode(node: any) {
-  // Skip VECTOR type nodes
-  if (node.type === "VECTOR") {
-    return null;
-  }
-
-  const filtered: any = {
-    id: node.id,
-    name: node.name,
-    type: node.type,
+function writeSvgToPath(
+  writePath: string,
+  svg: string,
+  outputDir?: string
+): { absolutePath: string; writePath: string; outputDir: string; bytes: number } {
+  const base = resolveOutputBase(outputDir);
+  const abs = resolveExportWritePath(writePath, outputDir);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, svg, "utf-8");
+  return {
+    absolutePath: abs,
+    writePath: path.relative(base, abs),
+    outputDir: base,
+    bytes: Buffer.byteLength(svg, "utf-8"),
   };
+}
 
-  if (node.fills && node.fills.length > 0) {
-    filtered.fills = node.fills.map((fill: any) => {
-      const processedFill = { ...fill };
+function writePngToPath(
+  writePath: string,
+  base64: string,
+  outputDir?: string
+): { absolutePath: string; writePath: string; outputDir: string; bytes: number } {
+  const base = resolveOutputBase(outputDir);
+  const abs = resolveExportWritePath(writePath, outputDir);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  const buf = Buffer.from(base64, "base64");
+  fs.writeFileSync(abs, buf);
+  return {
+    absolutePath: abs,
+    writePath: path.relative(base, abs),
+    outputDir: base,
+    bytes: buf.length,
+  };
+}
 
-      // Remove boundVariables and imageRef
-      delete processedFill.boundVariables;
-      delete processedFill.imageRef;
+const exportOutputDirField = z
+  .string()
+  .optional()
+  .describe(
+    "Directory to write files into. Absolute path or path relative to the MCP server cwd. When set, writePath is resolved under this directory instead of cwd."
+  );
 
-      // Process gradientStops if present
-      if (processedFill.gradientStops) {
-        processedFill.gradientStops = processedFill.gradientStops.map((stop: any) => {
-          const processedStop = { ...stop };
-          // Convert color to hex if present
-          if (processedStop.color) {
-            processedStop.color = rgbaToHex(processedStop.color);
-          }
-          // Remove boundVariables
-          delete processedStop.boundVariables;
-          return processedStop;
-        });
-      }
+const exportWritePathField = z
+  .string()
+  .optional()
+  .describe(
+    "File path (and optional subfolders) under outputDir, or under the MCP server cwd when outputDir is omitted. No path traversal."
+  );
 
-      // Convert solid fill colors to hex
-      if (processedFill.color) {
-        processedFill.color = rgbaToHex(processedFill.color);
-      }
-
-      return processedFill;
-    });
+function parsePluginSvgPayload(
+  result: { svg?: string; imageData?: string },
+  nodeId: string
+): { ok: true; svg: string } | { ok: false; message: string } {
+  if (result.svg && result.svg.trimStart().startsWith("<")) {
+    return { ok: true, svg: result.svg };
   }
 
-  if (node.strokes && node.strokes.length > 0) {
-    filtered.strokes = node.strokes.map((stroke: any) => {
-      const processedStroke = { ...stroke };
-      // Remove boundVariables
-      delete processedStroke.boundVariables;
-      // Convert color to hex if present
-      if (processedStroke.color) {
-        processedStroke.color = rgbaToHex(processedStroke.color);
-      }
-      return processedStroke;
-    });
-  }
-
-  if (node.cornerRadius !== undefined) {
-    filtered.cornerRadius = node.cornerRadius;
-  }
-
-  if (node.absoluteBoundingBox) {
-    filtered.absoluteBoundingBox = node.absoluteBoundingBox;
-  }
-
-  if (node.characters) {
-    filtered.characters = node.characters;
-  }
-
-  if (node.style) {
-    filtered.style = {
-      fontFamily: node.style.fontFamily,
-      fontStyle: node.style.fontStyle,
-      fontWeight: node.style.fontWeight,
-      fontSize: node.style.fontSize,
-      textAlignHorizontal: node.style.textAlignHorizontal,
-      letterSpacing: node.style.letterSpacing,
-      lineHeightPx: node.style.lineHeightPx
+  if (!result.imageData) {
+    return {
+      ok: false,
+      message: `No SVG payload for node ${nodeId}. Reload the dev plugin from this repo.`,
     };
   }
 
-  if (node.children) {
+  const buf = Buffer.from(result.imageData, "base64");
+  if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return {
+      ok: false,
+      message: `Export for ${nodeId} returned PNG instead of SVG. Reload the dev plugin.`,
+    };
+  }
+
+  const svg = buf.toString("utf-8").trimStart();
+  if (!svg.startsWith("<")) {
+    return {
+      ok: false,
+      message: `Export for ${nodeId} was not valid SVG markup.`,
+    };
+  }
+
+  return { ok: true, svg };
+}
+
+/** Figma API: `2403:34143` or instance paths `I2403:34143;2120:1096`. URLs use hyphens per segment. */
+const FIGMA_NODE_ID_FORMAT_HINT =
+  "Use Figma API ids (digits and colon, e.g. 2403:34143), paste from a URL (2403-34143), or an instance path (I2403-34143-2120-1096 → I2403:34143;2120:1096).";
+
+const FIGMA_NODE_ID_RE = /^(I)?(\d+:\d+)(;\d+:\d+)*$/;
+
+function normalizeFigmaNodeId(id: string): string {
+  let s = id.trim();
+  if (!s) {
+    throw new Error("nodeId is required");
+  }
+
+  const urlMatch = s.match(/(?:[?&]|^)node-id=([^&]+)/i);
+  if (urlMatch) {
+    s = decodeURIComponent(urlMatch[1]);
+  } else {
+    try {
+      if (/%[0-9A-Fa-f]{2}/.test(s)) {
+        s = decodeURIComponent(s);
+      }
+    } catch {
+      // keep s
+    }
+  }
+
+  s = s.trim();
+
+  if (FIGMA_NODE_ID_RE.test(s)) {
+    return s;
+  }
+
+  if (s.includes("-")) {
+    const instancePrefix = s.startsWith("I");
+    const body = instancePrefix ? s.slice(1) : s;
+    const segments = body.split("-");
+    if (segments.length < 2 || segments.length % 2 !== 0) {
+      throw new Error(
+        `Invalid node id "${id}": expected pageId-nodeId (2403-34143) or instance path (I2403-34143-2120-1096)`
+      );
+    }
+    const pairs: string[] = [];
+    for (let i = 0; i < segments.length; i += 2) {
+      if (!/^\d+$/.test(segments[i]) || !/^\d+$/.test(segments[i + 1])) {
+        throw new Error(`Invalid node id "${id}": segments must be numeric`);
+      }
+      pairs.push(`${segments[i]}:${segments[i + 1]}`);
+    }
+    const normalized = (instancePrefix ? "I" : "") + pairs.join(";");
+    if (!FIGMA_NODE_ID_RE.test(normalized)) {
+      throw new Error(`Invalid node id "${id}" after normalization: ${normalized}`);
+    }
+    return normalized;
+  }
+
+  throw new Error(
+    `Invalid node id "${id}": use pageId:nodeId (e.g. 2403:34143) or URL form 2403-34143`
+  );
+}
+
+function figmaNodeIdField(description: string) {
+  return z
+    .string()
+    .describe(`${description} ${FIGMA_NODE_ID_FORMAT_HINT}`)
+    .transform(normalizeFigmaNodeId);
+}
+
+function figmaNodeIdArrayField(description: string) {
+  return z
+    .array(z.string().transform(normalizeFigmaNodeId))
+    .min(1)
+    .describe(`${description} ${FIGMA_NODE_ID_FORMAT_HINT}`);
+}
+
+let ws: WebSocket | null = null;
+const pendingRequests = new Map<
+  string,
+  {
+    resolve: (value: unknown) => void;
+    reject: (reason: unknown) => void;
+    timeout: ReturnType<typeof setTimeout>;
+    lastActivity: number;
+  }
+>();
+
+let currentChannel: string | null = null;
+let currentChannelDescription: string | null = null;
+
+const server = new McpServer({
+  name: "TalkToFigmaMCPv2",
+  version: "2.0.0",
+});
+
+const args = process.argv.slice(2);
+const serverArg = args.find((arg) => arg.startsWith("--server="));
+const serverUrl = serverArg ? serverArg.split("=")[1] : "localhost";
+const WS_URL = serverUrl === "localhost" ? `ws://${serverUrl}` : `wss://${serverUrl}`;
+
+const socketPortArg = args.find((a) => a.startsWith("--port="));
+const FIGMA_SOCKET_PORT = (() => {
+  const n = socketPortArg
+    ? Number(socketPortArg.split("=", 2)[1])
+    : Number(process.env.PORT || "3055");
+  return Number.isFinite(n) && n > 0 ? n : 3055;
+})();
+
+function rgbaToHex(color: { r: number; g: number; b: number; a?: number } | string): string {
+  if (typeof color === "string" && color.startsWith("#")) {
+    return color;
+  }
+  const c = color as { r: number; g: number; b: number; a?: number };
+  const r = Math.round(c.r * 255);
+  const g = Math.round(c.g * 255);
+  const b = Math.round(c.b * 255);
+  const a = Math.round((c.a ?? 1) * 255);
+  return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}${a === 255 ? "" : a.toString(16).padStart(2, "0")}`;
+}
+
+function filterFigmaNode(node: Record<string, unknown> | null): Record<string, unknown> | null {
+  if (!node || typeof node !== "object") {
+    return null;
+  }
+
+  const filtered: Record<string, unknown> = { ...node };
+
+  if (Array.isArray(node.children)) {
     filtered.children = node.children
-      .map((child: any) => filterFigmaNode(child))
-      .filter((child: any) => child !== null); // Remove null children (VECTOR nodes)
+      .map((child) => filterFigmaNode(child as Record<string, unknown>))
+      .filter((child): child is Record<string, unknown> => child !== null);
   }
 
   return filtered;
 }
 
-// Nodes Info Tool
-figmaTool(
-  "get_nodes_info",
-  "Get detailed information about multiple nodes in Figma",
-  {
-    nodeIds: z.array(z.string()).describe("Array of node IDs to get information about")
-  },
-  async ({ nodeIds }: any) => {
-    try {
-      const results = await Promise.all(
-        nodeIds.map(async (nodeId: any) => {
-          const result = await sendCommandToFigma('get_node_info', { nodeId });
-          return { nodeId, info: result };
-        })
-      );
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(results.map((result) => filterFigmaNode(result.info)))
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error getting nodes info: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-
-// Create Rectangle Tool
-figmaTool(
-  "create_rectangle",
-  "Create a new rectangle in Figma",
-  {
-    x: z.number().describe("X position"),
-    y: z.number().describe("Y position"),
-    width: z.number().describe("Width of the rectangle"),
-    height: z.number().describe("Height of the rectangle"),
-    name: z.string().optional().describe("Optional name for the rectangle"),
-    parentId: z
-      .string()
-      .optional()
-      .describe("Optional parent node ID to append the rectangle to"),
-  },
-  async ({ x, y, width, height, name, parentId }: any) => {
-    try {
-      const result = await sendCommandToFigma("create_rectangle", {
-        x,
-        y,
-        width,
-        height,
-        name: name || "Rectangle",
-        parentId,
-      });
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Created rectangle "${JSON.stringify(result)}"`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error creating rectangle: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Create Frame Tool
-figmaTool(
-  "create_frame",
-  "Create a new frame in Figma",
-  {
-    x: z.number().describe("X position"),
-    y: z.number().describe("Y position"),
-    width: z.number().describe("Width of the frame"),
-    height: z.number().describe("Height of the frame"),
-    name: z.string().optional().describe("Optional name for the frame"),
-    parentId: z
-      .string()
-      .optional()
-      .describe("Optional parent node ID to append the frame to"),
-    fillColor: z
-      .object({
-        r: z.number().min(0).max(1).describe("Red component (0-1)"),
-        g: z.number().min(0).max(1).describe("Green component (0-1)"),
-        b: z.number().min(0).max(1).describe("Blue component (0-1)"),
-        a: z
-          .number()
-          .min(0)
-          .max(1)
-          .optional()
-          .describe("Alpha component (0-1)"),
-      })
-      .optional()
-      .describe("Fill color in RGBA format"),
-    strokeColor: z
-      .object({
-        r: z.number().min(0).max(1).describe("Red component (0-1)"),
-        g: z.number().min(0).max(1).describe("Green component (0-1)"),
-        b: z.number().min(0).max(1).describe("Blue component (0-1)"),
-        a: z
-          .number()
-          .min(0)
-          .max(1)
-          .optional()
-          .describe("Alpha component (0-1)"),
-      })
-      .optional()
-      .describe("Stroke color in RGBA format"),
-    strokeWeight: z.number().positive().optional().describe("Stroke weight"),
-    layoutMode: z.enum(["NONE", "HORIZONTAL", "VERTICAL"]).optional().describe("Auto-layout mode for the frame"),
-    layoutWrap: z.enum(["NO_WRAP", "WRAP"]).optional().describe("Whether the auto-layout frame wraps its children"),
-    paddingTop: z.number().optional().describe("Top padding for auto-layout frame"),
-    paddingRight: z.number().optional().describe("Right padding for auto-layout frame"),
-    paddingBottom: z.number().optional().describe("Bottom padding for auto-layout frame"),
-    paddingLeft: z.number().optional().describe("Left padding for auto-layout frame"),
-    primaryAxisAlignItems: z
-      .enum(["MIN", "MAX", "CENTER", "SPACE_BETWEEN"])
-      .optional()
-      .describe("Primary axis alignment for auto-layout frame. Note: When set to SPACE_BETWEEN, itemSpacing will be ignored as children will be evenly spaced."),
-    counterAxisAlignItems: z.enum(["MIN", "MAX", "CENTER", "BASELINE"]).optional().describe("Counter axis alignment for auto-layout frame"),
-    layoutSizingHorizontal: z.enum(["FIXED", "HUG", "FILL"]).optional().describe("Horizontal sizing mode for auto-layout frame"),
-    layoutSizingVertical: z.enum(["FIXED", "HUG", "FILL"]).optional().describe("Vertical sizing mode for auto-layout frame"),
-    itemSpacing: z
-      .number()
-      .optional()
-      .describe("Distance between children in auto-layout frame. Note: This value will be ignored if primaryAxisAlignItems is set to SPACE_BETWEEN.")
-  },
-  async ({
-    x,
-    y,
-    width,
-    height,
-    name,
-    parentId,
-    fillColor,
-    strokeColor,
-    strokeWeight,
-    layoutMode,
-    layoutWrap,
-    paddingTop,
-    paddingRight,
-    paddingBottom,
-    paddingLeft,
-    primaryAxisAlignItems,
-    counterAxisAlignItems,
-    layoutSizingHorizontal,
-    layoutSizingVertical,
-    itemSpacing
-  }: any) => {
-    try {
-      const result = await sendCommandToFigma("create_frame", {
-        x,
-        y,
-        width,
-        height,
-        name: name || "Frame",
-        parentId,
-        fillColor: fillColor || { r: 1, g: 1, b: 1, a: 1 },
-        strokeColor: strokeColor,
-        strokeWeight: strokeWeight,
-        layoutMode,
-        layoutWrap,
-        paddingTop,
-        paddingRight,
-        paddingBottom,
-        paddingLeft,
-        primaryAxisAlignItems,
-        counterAxisAlignItems,
-        layoutSizingHorizontal,
-        layoutSizingVertical,
-        itemSpacing
-      });
-      const typedResult = result as { name: string; id: string };
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Created frame "${typedResult.name}" with ID: ${typedResult.id}. Use the ID as the parentId to appendChild inside this frame.`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error creating frame: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Create Text Tool
-figmaTool(
-  "create_text",
-  "Create a new text element in Figma",
-  {
-    x: z.number().describe("X position"),
-    y: z.number().describe("Y position"),
-    text: z.string().describe("Text content"),
-    fontSize: z.number().optional().describe("Font size (default: 14)"),
-    fontWeight: z
-      .number()
-      .optional()
-      .describe("Font weight (e.g., 400 for Regular, 700 for Bold)"),
-    fontColor: z
-      .object({
-        r: z.number().min(0).max(1).describe("Red component (0-1)"),
-        g: z.number().min(0).max(1).describe("Green component (0-1)"),
-        b: z.number().min(0).max(1).describe("Blue component (0-1)"),
-        a: z
-          .number()
-          .min(0)
-          .max(1)
-          .optional()
-          .describe("Alpha component (0-1)"),
-      })
-      .optional()
-      .describe("Font color in RGBA format"),
-    name: z
-      .string()
-      .optional()
-      .describe("Semantic layer name for the text node"),
-    parentId: z
-      .string()
-      .optional()
-      .describe("Optional parent node ID to append the text to"),
-  },
-  async ({ x, y, text, fontSize, fontWeight, fontColor, name, parentId }: any) => {
-    try {
-      const result = await sendCommandToFigma("create_text", {
-        x,
-        y,
-        text,
-        fontSize: fontSize || 14,
-        fontWeight: fontWeight || 400,
-        fontColor: fontColor || { r: 0, g: 0, b: 0, a: 1 },
-        name: name || "Text",
-        parentId,
-      });
-      const typedResult = result as { name: string; id: string };
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Created text "${typedResult.name}" with ID: ${typedResult.id}`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error creating text: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Set Fill Color Tool
-figmaTool(
-  "set_fill_color",
-  "Set the fill color of a node in Figma can be TextNode or FrameNode",
-  {
-    nodeId: z.string().describe("The ID of the node to modify"),
-    r: z.number().min(0).max(1).describe("Red component (0-1)"),
-    g: z.number().min(0).max(1).describe("Green component (0-1)"),
-    b: z.number().min(0).max(1).describe("Blue component (0-1)"),
-    a: z.number().min(0).max(1).optional().describe("Alpha component (0-1)"),
-  },
-  async ({ nodeId, r, g, b, a }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_fill_color", {
-        nodeId,
-        color: { r, g, b, a: a || 1 },
-      });
-      const typedResult = result as { name: string };
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Set fill color of node "${typedResult.name
-              }" to RGBA(${r}, ${g}, ${b}, ${a || 1})`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting fill color: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Set Stroke Color Tool
-figmaTool(
-  "set_stroke_color",
-  "Set the stroke color of a node in Figma",
-  {
-    nodeId: z.string().describe("The ID of the node to modify"),
-    r: z.number().min(0).max(1).describe("Red component (0-1)"),
-    g: z.number().min(0).max(1).describe("Green component (0-1)"),
-    b: z.number().min(0).max(1).describe("Blue component (0-1)"),
-    a: z.number().min(0).max(1).optional().describe("Alpha component (0-1)"),
-    weight: z.number().positive().optional().describe("Stroke weight"),
-  },
-  async ({ nodeId, r, g, b, a, weight }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_stroke_color", {
-        nodeId,
-        color: { r, g, b, a: a || 1 },
-        weight: weight || 1,
-      });
-      const typedResult = result as { name: string };
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Set stroke color of node "${typedResult.name
-              }" to RGBA(${r}, ${g}, ${b}, ${a || 1}) with weight ${weight || 1}`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting stroke color: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Move Node Tool
-figmaTool(
-  "move_node",
-  "Move a node to a new position in Figma",
-  {
-    nodeId: z.string().describe("The ID of the node to move"),
-    x: z.number().describe("New X position"),
-    y: z.number().describe("New Y position"),
-  },
-  async ({ nodeId, x, y }: any) => {
-    try {
-      const result = await sendCommandToFigma("move_node", { nodeId, x, y });
-      const typedResult = result as { name: string };
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Moved node "${typedResult.name}" to position (${x}, ${y})`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error moving node: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Clone Node Tool
-figmaTool(
-  "clone_node",
-  "Clone an existing node in Figma",
-  {
-    nodeId: z.string().describe("The ID of the node to clone"),
-    x: z.number().optional().describe("New X position for the clone"),
-    y: z.number().optional().describe("New Y position for the clone")
-  },
-  async ({ nodeId, x, y }: any) => {
-    try {
-      const result = await sendCommandToFigma('clone_node', { nodeId, x, y });
-      const typedResult = result as { name: string, id: string };
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Cloned node "${typedResult.name}" with new ID: ${typedResult.id}${x !== undefined && y !== undefined ? ` at position (${x}, ${y})` : ''}`
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error cloning node: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ]
-      };
-    }
-  }
-);
-
-// Resize Node Tool
-figmaTool(
-  "resize_node",
-  "Resize a node in Figma",
-  {
-    nodeId: z.string().describe("The ID of the node to resize"),
-    width: z.number().positive().describe("New width"),
-    height: z.number().positive().describe("New height"),
-  },
-  async ({ nodeId, width, height }: any) => {
-    try {
-      const result = await sendCommandToFigma("resize_node", {
-        nodeId,
-        width,
-        height,
-      });
-      const typedResult = result as { name: string };
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Resized node "${typedResult.name}" to width ${width} and height ${height}`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error resizing node: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Delete Node Tool
-figmaTool(
-  "delete_node",
-  "Delete a node from Figma",
-  {
-    nodeId: z.string().describe("The ID of the node to delete"),
-  },
-  async ({ nodeId }: any) => {
-    try {
-      await sendCommandToFigma("delete_node", { nodeId });
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Deleted node with ID: ${nodeId}`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error deleting node: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Delete Multiple Nodes Tool
-figmaTool(
-  "delete_multiple_nodes",
-  "Delete multiple nodes from Figma at once",
-  {
-    nodeIds: z.array(z.string()).describe("Array of node IDs to delete"),
-  },
-  async ({ nodeIds }: any) => {
-    try {
-      const result = await sendCommandToFigma("delete_multiple_nodes", { nodeIds });
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result)
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error deleting multiple nodes: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Export Node as Image Tool
-figmaTool(
-  "export_node_as_image",
-  "Export a node from Figma. PNG/JPG: returns image (base64). SVG: returns plaintext XML plus an SVG image preview when the client supports it. PDF: returns base64 image block (binary preview). Optional writePath: for PNG/JPG write raw bytes; for SVG write UTF-8 markup (relative to MCP server cwd, no path traversal). Prefer export_node_as_svg when you only need SVG. Without an MCP client, same relay setup: run this binary with --export-png --channel=... --node=... --out=relative.png [--scale=4] [--port=3055].",
-  {
-    nodeId: z.string().describe("The ID of the node to export"),
-    format: z
-      .enum(["PNG", "JPG", "SVG", "PDF"])
-      .optional()
-      .describe("Export format"),
-    scale: z.number().positive().optional().describe("Export scale (PNG/JPG only; ignored for SVG/PDF)"),
-    writePath: z
-      .string()
-      .optional()
-      .describe(
-        "If set: PNG/JPG write decoded raster bytes; SVG write UTF-8 XML. Path is relative to the MCP server cwd (no path traversal)."
-      ),
-  },
-  async ({ nodeId, format, scale, writePath }: any) => {
-    try {
-      const resolvedFormat = format || "PNG";
-      const result = await sendCommandToFigma("export_node_as_image", {
-        nodeId,
-        format: resolvedFormat,
-        scale: scale || 1,
-      });
-      const typedResult = result as {
-        imageData: string;
-        mimeType: string;
-        format?: string;
-      };
-      const mimeType = typedResult.mimeType || "image/png";
-
-      if (resolvedFormat === "SVG" || mimeType === "image/svg+xml") {
-        const parsed = parsePluginSvgExport(typedResult.imageData, nodeId);
-        if (parsed.ok === false) {
-          return {
-            content: [{ type: "text", text: parsed.message }],
-          };
-        }
-        return mcpContentForSvgExport({
-          nodeId,
-          imageDataBase64: typedResult.imageData,
-          mimeType: typedResult.mimeType || "image/svg+xml",
-          svg: parsed.svg,
-          writePath,
-          fromImageTool: true,
-        });
-      }
-
-      const content: Array<
-        | { type: "text"; text: string }
-        | { type: "image"; data: string; mimeType: string }
-      > = [];
-
-      if (
-        writePath &&
-        (resolvedFormat === "PNG" ||
-          resolvedFormat === "JPG" ||
-          mimeType === "image/png" ||
-          mimeType === "image/jpeg")
-      ) {
-        const abs = resolveWritePathUnderCwd(writePath);
-        const buf = Buffer.from(typedResult.imageData, "base64");
-        fs.mkdirSync(path.dirname(abs), { recursive: true });
-        fs.writeFileSync(abs, buf);
-        const rel = path.relative(process.cwd(), abs);
-        content.push({
-          type: "text",
-          text: `Wrote ${rel} (${buf.byteLength} bytes).`,
-        });
-      }
-
-      content.push({
-        type: "image",
-        data: typedResult.imageData,
-        mimeType,
-      });
-
-      return { content };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error exporting node as image: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-async function runExportNodeAsSvgTool(params: {
-  nodeId: string;
-  writePath?: string;
-}): Promise<{ content: SvgExportContentPart[] }> {
-  const result = await sendCommandToFigma("export_node_as_image", {
-    nodeId: params.nodeId,
-    format: "SVG",
-    scale: 1,
-  });
-  const typedResult = result as { imageData: string; mimeType: string };
-  const parsed = parsePluginSvgExport(typedResult.imageData, params.nodeId);
-  if (parsed.ok === false) {
-    return { content: [{ type: "text", text: parsed.message }] };
-  }
-  return mcpContentForSvgExport({
-    nodeId: params.nodeId,
-    imageDataBase64: typedResult.imageData,
-    mimeType: typedResult.mimeType || "image/svg+xml",
-    svg: parsed.svg,
-    writePath: params.writePath,
-    fromImageTool: false,
-  });
+interface BoundingBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
-figmaTool(
-  "export_node_as_svg",
-  "Export a Figma node as SVG: returns UTF-8 markup in the response and an SVG image preview when supported. Optional writePath writes a .svg file under the MCP server cwd (no path traversal). Use this instead of format SVG on export_node_as_image when you only need vector output.",
-  {
-    nodeId: z.string().describe("The ID of the node to export as SVG"),
-    writePath: z
-      .string()
-      .optional()
-      .describe(
-        "If set, write UTF-8 SVG markup to this path relative to the MCP server cwd (no path traversal)."
-      ),
-  },
-  async ({ nodeId, writePath }: any) => {
-    try {
-      return await runExportNodeAsSvgTool({ nodeId, writePath });
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error exporting node as SVG: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-figmaTool(
-  "copy_node_as_svg",
-  "Alias of export_node_as_svg (identical parameters and behavior). Prefer export_node_as_svg in new workflows.",
-  {
-    nodeId: z.string().describe("The ID of the node to export as SVG"),
-    writePath: z
-      .string()
-      .optional()
-      .describe(
-        "If set, write UTF-8 SVG markup to this path relative to the MCP server cwd (no path traversal)."
-      ),
-  },
-  async ({ nodeId, writePath }: any) => {
-    try {
-      return await runExportNodeAsSvgTool({ nodeId, writePath });
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error exporting SVG: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Set Text Content Tool
-figmaTool(
-  "set_text_content",
-  "Set the text content of an existing text node in Figma",
-  {
-    nodeId: z.string().describe("The ID of the text node to modify"),
-    text: z.string().describe("New text content"),
-  },
-  async ({ nodeId, text }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_text_content", {
-        nodeId,
-        text,
-      });
-      const typedResult = result as { name: string };
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Updated text content of node "${typedResult.name}" to "${text}"`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting text content: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Get Styles Tool
-figmaTool(
-  "get_styles",
-  "Get all styles from the current Figma document",
-  {},
-  async () => {
-    try {
-      const result = await sendCommandToFigma("get_styles");
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result)
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error getting styles: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Get Local Components Tool
-figmaTool(
-  "get_local_components",
-  "Get all local components from the Figma document",
-  {},
-  async () => {
-    try {
-      const result = await sendCommandToFigma("get_local_components");
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result)
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error getting local components: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Get Annotations Tool
-figmaTool(
-  "get_annotations",
-  "Get all annotations in the current document or specific node",
-  {
-    nodeId: z.string().describe("node ID to get annotations for specific node"),
-    includeCategories: z.boolean().optional().default(true).describe("Whether to include category information")
-  },
-  async ({ nodeId, includeCategories }: any) => {
-    try {
-      const result = await sendCommandToFigma("get_annotations", {
-        nodeId,
-        includeCategories
-      });
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result)
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error getting annotations: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ]
-      };
-    }
-  }
-);
-
-// Set Annotation Tool
-figmaTool(
-  "set_annotation",
-  "Create or update an annotation",
-  {
-    nodeId: z.string().describe("The ID of the node to annotate"),
-    annotationId: z.string().optional().describe("The ID of the annotation to update (if updating existing annotation)"),
-    labelMarkdown: z.string().describe("The annotation text in markdown format"),
-    categoryId: z.string().optional().describe("The ID of the annotation category"),
-    properties: z.array(z.object({
-      type: z.string()
-    })).optional().describe("Additional properties for the annotation")
-  },
-  async ({ nodeId, annotationId, labelMarkdown, categoryId, properties }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_annotation", {
-        nodeId,
-        annotationId,
-        labelMarkdown,
-        categoryId,
-        properties
-      });
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result)
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting annotation: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ]
-      };
-    }
-  }
-);
-
-interface SetMultipleAnnotationsParams {
-  nodeId: string;
-  annotations: Array<{
-    nodeId: string;
-    labelMarkdown: string;
-    categoryId?: string;
-    annotationId?: string;
-    properties?: Array<{ type: string }>;
-  }>;
+interface NodeBoxSummary {
+  id: string;
+  name: string;
+  type: string;
+  box: BoundingBox;
+  edges: { top: number; right: number; bottom: number; left: number };
+  center: { x: number; y: number };
 }
 
-// Set Multiple Annotations Tool
-figmaTool(
-  "set_multiple_annotations",
-  "Set multiple annotations parallelly in a node",
-  {
-    nodeId: z
-      .string()
-      .describe("The ID of the node containing the elements to annotate"),
-    annotations: z
-      .array(
-        z.object({
-          nodeId: z.string().describe("The ID of the node to annotate"),
-          labelMarkdown: z.string().describe("The annotation text in markdown format"),
-          categoryId: z.string().optional().describe("The ID of the annotation category"),
-          annotationId: z.string().optional().describe("The ID of the annotation to update (if updating existing annotation)"),
-          properties: z.array(z.object({
-            type: z.string()
-          })).optional().describe("Additional properties for the annotation")
-        })
-      )
-      .describe("Array of annotations to apply"),
-  },
-  async ({ nodeId, annotations }: any) => {
-    try {
-      if (!annotations || annotations.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "No annotations provided",
-            },
-          ],
-        };
-      }
-
-      // Initial response to indicate we're starting the process
-      const initialStatus = {
-        type: "text" as const,
-        text: `Starting annotation process for ${annotations.length} nodes. This will be processed in batches of 5...`,
-      };
-
-      // Track overall progress
-      let totalProcessed = 0;
-      const totalToProcess = annotations.length;
-
-      // Use the plugin's set_multiple_annotations function with chunking
-      const result = await sendCommandToFigma("set_multiple_annotations", {
-        nodeId,
-        annotations,
-      });
-
-      // Cast the result to a specific type to work with it safely
-      interface AnnotationResult {
-        success: boolean;
-        nodeId: string;
-        annotationsApplied?: number;
-        annotationsFailed?: number;
-        totalAnnotations?: number;
-        completedInChunks?: number;
-        results?: Array<{
-          success: boolean;
-          nodeId: string;
-          error?: string;
-          annotationId?: string;
-        }>;
-      }
-
-      const typedResult = result as AnnotationResult;
-
-      // Format the results for display
-      const success = typedResult.annotationsApplied && typedResult.annotationsApplied > 0;
-      const progressText = `
-      Annotation process completed:
-      - ${typedResult.annotationsApplied || 0} of ${totalToProcess} successfully applied
-      - ${typedResult.annotationsFailed || 0} failed
-      - Processed in ${typedResult.completedInChunks || 1} batches
-      `;
-
-      // Detailed results
-      const detailedResults = typedResult.results || [];
-      const failedResults = detailedResults.filter(item => !item.success);
-
-      // Create the detailed part of the response
-      let detailedResponse = "";
-      if (failedResults.length > 0) {
-        detailedResponse = `\n\nNodes that failed:\n${failedResults.map(item =>
-          `- ${item.nodeId}: ${item.error || "Unknown error"}`
-        ).join('\n')}`;
-      }
-
-      return {
-        content: [
-          initialStatus,
-          {
-            type: "text" as const,
-            text: progressText + detailedResponse,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting multiple annotations: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Create Component Instance Tool
-figmaTool(
-  "create_component_instance",
-  "Create an instance of a component in Figma. For LOCAL components (from get_local_components), use componentId with the id field. For published LIBRARY components, use componentKey with the publishedKey field.",
-  {
-    componentId: z.string().optional().describe("ID of a local component (use the id field from get_local_components result). Use this for unpublished/local components."),
-    componentKey: z.string().optional().describe("Key of a published library component to instantiate (use the publishedKey field from get_local_components result). Only works for published components."),
-    x: z.number().describe("X position"),
-    y: z.number().describe("Y position"),
-    parentId: z.string().optional().describe("Optional parent node ID to place the instance into"),
-  },
-  async ({ componentId, componentKey, x, y, parentId }: any) => {
-    try {
-      const result = await sendCommandToFigma("create_component_instance", {
-        componentId,
-        componentKey,
-        x,
-        y,
-        parentId,
-      });
-      const typedResult = result as any;
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(typedResult),
-          }
-        ]
-      }
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error creating component instance: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Copy Instance Overrides Tool
-figmaTool(
-  "get_instance_overrides",
-  "Get all override properties from a selected component instance. These overrides can be applied to other instances, which will swap them to match the source component.",
-  {
-    nodeId: z.string().optional().describe("Optional ID of the component instance to get overrides from. If not provided, currently selected instance will be used."),
-  },
-  async ({ nodeId }: any) => {
-    try {
-      const result = await sendCommandToFigma("get_instance_overrides", {
-        instanceNodeId: nodeId || null
-      });
-      const typedResult = result as getInstanceOverridesResult;
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: typedResult.success
-              ? `Successfully got instance overrides: ${typedResult.message}`
-              : `Failed to get instance overrides: ${typedResult.message}`
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error copying instance overrides: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ]
-      };
-    }
-  }
-);
-
-// Set Instance Overrides Tool
-figmaTool(
-  "set_instance_overrides",
-  "Apply previously copied overrides to selected component instances. Target instances will be swapped to the source component and all copied override properties will be applied.",
-  {
-    sourceInstanceId: z.string().describe("ID of the source component instance"),
-    targetNodeIds: z.array(z.string()).describe("Array of target instance IDs. Currently selected instances will be used.")
-  },
-  async ({ sourceInstanceId, targetNodeIds }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_instance_overrides", {
-        sourceInstanceId: sourceInstanceId,
-        targetNodeIds: targetNodeIds || []
-      });
-      const typedResult = result as setInstanceOverridesResult;
-
-      if (typedResult.success) {
-        const successCount = typedResult.results?.filter(r => r.success).length || 0;
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Successfully applied ${typedResult.totalCount || 0} overrides to ${successCount} instances.`
-            }
-          ]
-        };
-      } else {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Failed to set instance overrides: ${typedResult.message}`
-            }
-          ]
-        };
-      }
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting instance overrides: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ]
-      };
-    }
-  }
-);
-
-
-// Set Corner Radius Tool
-figmaTool(
-  "set_corner_radius",
-  "Set the corner radius of a node in Figma",
-  {
-    nodeId: z.string().describe("The ID of the node to modify"),
-    radius: z.number().min(0).describe("Corner radius value"),
-    corners: z
-      .array(z.boolean())
-      .length(4)
-      .optional()
-      .describe(
-        "Optional array of 4 booleans to specify which corners to round [topLeft, topRight, bottomRight, bottomLeft]"
-      ),
-  },
-  async ({ nodeId, radius, corners }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_corner_radius", {
-        nodeId,
-        radius,
-        corners: corners || [true, true, true, true],
-      });
-      const typedResult = result as { name: string };
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Set corner radius of node "${typedResult.name}" to ${radius}px`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting corner radius: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Define design strategy prompt
-figmaPrompt(
-  "design_strategy",
-  "Best practices for working with Figma designs",
-  (extra) => {
-    return {
-      messages: [
-        {
-          role: "assistant",
-          content: {
-            type: "text",
-            text: `When working with Figma designs, follow these best practices:
-
-1. Start with Document Structure:
-   - First use get_document_info() to understand the current document
-   - Plan your layout hierarchy before creating elements
-   - Create a main container frame for each screen/section
-
-2. Naming Conventions:
-   - Use descriptive, semantic names for all elements
-   - Follow a consistent naming pattern (e.g., "Login Screen", "Logo Container", "Email Input")
-   - Group related elements with meaningful names
-
-3. Layout Hierarchy:
-   - Create parent frames first, then add child elements
-   - For forms/login screens:
-     * Start with the main screen container frame
-     * Create a logo container at the top
-     * Group input fields in their own containers
-     * Place action buttons (login, submit) after inputs
-     * Add secondary elements (forgot password, signup links) last
-
-4. Input Fields Structure:
-   - Create a container frame for each input field
-   - Include a label text above or inside the input
-   - Group related inputs (e.g., username/password) together
-
-5. Element Creation:
-   - Use create_frame() for containers and input fields
-   - Use create_text() for labels, buttons text, and links
-   - Set appropriate colors and styles:
-     * Use fillColor for backgrounds
-     * Use strokeColor for borders
-     * Set proper fontWeight for different text elements
-
-6. Mofifying existing elements:
-  - use set_text_content() to modify text content.
-
-7. Visual Hierarchy:
-   - Position elements in logical reading order (top to bottom)
-   - Maintain consistent spacing between elements
-   - Use appropriate font sizes for different text types:
-     * Larger for headings/welcome text
-     * Medium for input labels
-     * Standard for button text
-     * Smaller for helper text/links
-
-8. Best Practices:
-   - Verify each creation with get_node_info()
-   - Use parentId to maintain proper hierarchy
-   - Group related elements together in frames
-   - Keep consistent spacing and alignment
-
-Example Login Screen Structure:
-- Login Screen (main frame)
-  - Logo Container (frame)
-    - Logo (image/text)
-  - Welcome Text (text)
-  - Input Container (frame)
-    - Email Input (frame)
-      - Email Label (text)
-      - Email Field (frame)
-    - Password Input (frame)
-      - Password Label (text)
-      - Password Field (frame)
-  - Login Button (frame)
-    - Button Text (text)
-  - Helper Links (frame)
-    - Forgot Password (text)
-    - Don't have account (text)`,
-          },
-        },
-      ],
-      description: "Best practices for working with Figma designs",
-    };
-  }
-);
-
-// Text Node Scanning Tool
-figmaTool(
-  "scan_text_nodes",
-  "Scan all text nodes in the selected Figma node",
-  {
-    nodeId: z.string().describe("ID of the node to scan"),
-  },
-  async ({ nodeId }: any) => {
-    try {
-      // Initial response to indicate we're starting the process
-      const initialStatus = {
-        type: "text" as const,
-        text: "Starting text node scanning. This may take a moment for large designs...",
-      };
-
-      // Use the plugin's scan_text_nodes function with chunking flag
-      const result = await sendCommandToFigma("scan_text_nodes", {
-        nodeId,
-        useChunking: true,  // Enable chunking on the plugin side
-        chunkSize: 10       // Process 10 nodes at a time
-      });
-
-      // If the result indicates chunking was used, format the response accordingly
-      if (result && typeof result === 'object' && 'chunks' in result) {
-        const typedResult = result as {
-          success: boolean,
-          totalNodes: number,
-          processedNodes: number,
-          chunks: number,
-          textNodes: Array<any>
-        };
-
-        const summaryText = `
-        Scan completed:
-        - Found ${typedResult.totalNodes} text nodes
-        - Processed in ${typedResult.chunks} chunks
-        `;
-
-        return {
-          content: [
-            initialStatus,
-            {
-              type: "text" as const,
-              text: summaryText
-            },
-            {
-              type: "text" as const,
-              text: JSON.stringify(typedResult.textNodes, null, 2)
-            }
-          ],
-        };
-      }
-
-      // If chunking wasn't used or wasn't reported in the result format, return the result as is
-      return {
-        content: [
-          initialStatus,
-          {
-            type: "text",
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error scanning text nodes: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Node Type Scanning Tool
-figmaTool(
-  "scan_nodes_by_types",
-  "Scan for child nodes with specific types in the selected Figma node",
-  {
-    nodeId: z.string().describe("ID of the node to scan"),
-    types: z.array(z.string()).describe("Array of node types to find in the child nodes (e.g. ['COMPONENT', 'FRAME'])")
-  },
-  async ({ nodeId, types }: any) => {
-    try {
-      // Initial response to indicate we're starting the process
-      const initialStatus = {
-        type: "text" as const,
-        text: `Starting node type scanning for types: ${types.join(', ')}...`,
-      };
-
-      // Use the plugin's scan_nodes_by_types function
-      const result = await sendCommandToFigma("scan_nodes_by_types", {
-        nodeId,
-        types
-      });
-
-      // Format the response
-      if (result && typeof result === 'object' && 'matchingNodes' in result) {
-        const typedResult = result as {
-          success: boolean,
-          count: number,
-          matchingNodes: Array<{
-            id: string,
-            name: string,
-            type: string,
-            bbox: {
-              x: number,
-              y: number,
-              width: number,
-              height: number
-            }
-          }>,
-          searchedTypes: Array<string>
-        };
-
-        const summaryText = `Scan completed: Found ${typedResult.count} nodes matching types: ${typedResult.searchedTypes.join(', ')}`;
-
-        return {
-          content: [
-            initialStatus,
-            {
-              type: "text" as const,
-              text: summaryText
-            },
-            {
-              type: "text" as const,
-              text: JSON.stringify(typedResult.matchingNodes, null, 2)
-            }
-          ],
-        };
-      }
-
-      // If the result is in an unexpected format, return it as is
-      return {
-        content: [
-          initialStatus,
-          {
-            type: "text",
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error scanning nodes by types: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Text Replacement Strategy Prompt
-figmaPrompt(
-  "text_replacement_strategy",
-  "Systematic approach for replacing text in Figma designs",
-  (extra) => {
-    return {
-      messages: [
-        {
-          role: "assistant",
-          content: {
-            type: "text",
-            text: `# Intelligent Text Replacement Strategy
-
-## 1. Analyze Design & Identify Structure
-- Scan text nodes to understand the overall structure of the design
-- Use AI pattern recognition to identify logical groupings:
-  * Tables (rows, columns, headers, cells)
-  * Lists (items, headers, nested lists)
-  * Card groups (similar cards with recurring text fields)
-  * Forms (labels, input fields, validation text)
-  * Navigation (menu items, breadcrumbs)
-\`\`\`
-scan_text_nodes(nodeId: "node-id")
-get_node_info(nodeId: "node-id")  // optional
-\`\`\`
-
-## 2. Strategic Chunking for Complex Designs
-- Divide replacement tasks into logical content chunks based on design structure
-- Use one of these chunking strategies that best fits the design:
-  * **Structural Chunking**: Table rows/columns, list sections, card groups
-  * **Spatial Chunking**: Top-to-bottom, left-to-right in screen areas
-  * **Semantic Chunking**: Content related to the same topic or functionality
-  * **Component-Based Chunking**: Process similar component instances together
-
-## 3. Progressive Replacement with Verification
-- Create a safe copy of the node for text replacement
-- Replace text chunk by chunk with continuous progress updates
-- After each chunk is processed:
-  * Export that section as a small, manageable image
-  * Verify text fits properly and maintain design integrity
-  * Fix issues before proceeding to the next chunk
-
-\`\`\`
-// Clone the node to create a safe copy
-clone_node(nodeId: "selected-node-id", x: [new-x], y: [new-y])
-
-// Replace text chunk by chunk
-set_multiple_text_contents(
-  nodeId: "parent-node-id", 
-  text: [
-    { nodeId: "node-id-1", text: "New text 1" },
-    // More nodes in this chunk...
-  ]
-)
-
-// Verify chunk with small, targeted image exports
-export_node_as_image(nodeId: "chunk-node-id", format: "PNG", scale: 0.5)
-\`\`\`
-
-## 4. Intelligent Handling for Table Data
-- For tabular content:
-  * Process one row or column at a time
-  * Maintain alignment and spacing between cells
-  * Consider conditional formatting based on cell content
-  * Preserve header/data relationships
-
-## 5. Smart Text Adaptation
-- Adaptively handle text based on container constraints:
-  * Auto-detect space constraints and adjust text length
-  * Apply line breaks at appropriate linguistic points
-  * Maintain text hierarchy and emphasis
-  * Consider font scaling for critical content that must fit
-
-## 6. Progressive Feedback Loop
-- Establish a continuous feedback loop during replacement:
-  * Real-time progress updates (0-100%)
-  * Small image exports after each chunk for verification
-  * Issues identified early and resolved incrementally
-  * Quick adjustments applied to subsequent chunks
-
-## 7. Final Verification & Context-Aware QA
-- After all chunks are processed:
-  * Export the entire design at reduced scale for final verification
-  * Check for cross-chunk consistency issues
-  * Verify proper text flow between different sections
-  * Ensure design harmony across the full composition
-
-## 8. Chunk-Specific Export Scale Guidelines
-- Scale exports appropriately based on chunk size:
-  * Small chunks (1-5 elements): scale 1.0
-  * Medium chunks (6-20 elements): scale 0.7
-  * Large chunks (21-50 elements): scale 0.5
-  * Very large chunks (50+ elements): scale 0.3
-  * Full design verification: scale 0.2
-
-## Sample Chunking Strategy for Common Design Types
-
-### Tables
-- Process by logical rows (5-10 rows per chunk)
-- Alternative: Process by column for columnar analysis
-- Tip: Always include header row in first chunk for reference
-
-### Card Lists
-- Group 3-5 similar cards per chunk
-- Process entire cards to maintain internal consistency
-- Verify text-to-image ratio within cards after each chunk
-
-### Forms
-- Group related fields (e.g., "Personal Information", "Payment Details")
-- Process labels and input fields together
-- Ensure validation messages and hints are updated with their fields
-
-### Navigation & Menus
-- Process hierarchical levels together (main menu, submenu)
-- Respect information architecture relationships
-- Verify menu fit and alignment after replacement
-
-## Best Practices
-- **Preserve Design Intent**: Always prioritize design integrity
-- **Structural Consistency**: Maintain alignment, spacing, and hierarchy
-- **Visual Feedback**: Verify each chunk visually before proceeding
-- **Incremental Improvement**: Learn from each chunk to improve subsequent ones
-- **Balance Automation & Control**: Let AI handle repetitive replacements but maintain oversight
-- **Respect Content Relationships**: Keep related content consistent across chunks
-
-Remember that text is never just text—it's a core design element that must work harmoniously with the overall composition. This chunk-based strategy allows you to methodically transform text while maintaining design integrity.`,
-          },
-        },
-      ],
-      description: "Systematic approach for replacing text in Figma designs",
-    };
-  }
-);
-
-// Set Multiple Text Contents Tool
-figmaTool(
-  "set_multiple_text_contents",
-  "Set multiple text contents parallelly in a node",
-  {
-    nodeId: z
-      .string()
-      .describe("The ID of the node containing the text nodes to replace"),
-    text: z
-      .array(
-        z.object({
-          nodeId: z.string().describe("The ID of the text node"),
-          text: z.string().describe("The replacement text"),
-        })
-      )
-      .describe("Array of text node IDs and their replacement texts"),
-  },
-  async ({ nodeId, text }: any) => {
-    try {
-      if (!text || text.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "No text provided",
-            },
-          ],
-        };
-      }
-
-      // Initial response to indicate we're starting the process
-      const initialStatus = {
-        type: "text" as const,
-        text: `Starting text replacement for ${text.length} nodes. This will be processed in batches of 5...`,
-      };
-
-      // Track overall progress
-      let totalProcessed = 0;
-      const totalToProcess = text.length;
-
-      // Use the plugin's set_multiple_text_contents function with chunking
-      const result = await sendCommandToFigma("set_multiple_text_contents", {
-        nodeId,
-        text,
-      });
-
-      // Cast the result to a specific type to work with it safely
-      interface TextReplaceResult {
-        success: boolean;
-        nodeId: string;
-        replacementsApplied?: number;
-        replacementsFailed?: number;
-        totalReplacements?: number;
-        completedInChunks?: number;
-        results?: Array<{
-          success: boolean;
-          nodeId: string;
-          error?: string;
-          originalText?: string;
-          translatedText?: string;
-        }>;
-      }
-
-      const typedResult = result as TextReplaceResult;
-
-      // Format the results for display
-      const success = typedResult.replacementsApplied && typedResult.replacementsApplied > 0;
-      const progressText = `
-      Text replacement completed:
-      - ${typedResult.replacementsApplied || 0} of ${totalToProcess} successfully updated
-      - ${typedResult.replacementsFailed || 0} failed
-      - Processed in ${typedResult.completedInChunks || 1} batches
-      `;
-
-      // Detailed results
-      const detailedResults = typedResult.results || [];
-      const failedResults = detailedResults.filter(item => !item.success);
-
-      // Create the detailed part of the response
-      let detailedResponse = "";
-      if (failedResults.length > 0) {
-        detailedResponse = `\n\nNodes that failed:\n${failedResults.map(item =>
-          `- ${item.nodeId}: ${item.error || "Unknown error"}`
-        ).join('\n')}`;
-      }
-
-      return {
-        content: [
-          initialStatus,
-          {
-            type: "text" as const,
-            text: progressText + detailedResponse,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting multiple text contents: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Annotation Conversion Strategy Prompt
-figmaPrompt(
-  "annotation_conversion_strategy",
-  "Strategy for converting manual annotations to Figma's native annotations",
-  (extra) => {
-    return {
-      messages: [
-        {
-          role: "assistant",
-          content: {
-            type: "text",
-            text: `# Automatic Annotation Conversion
-            
-## Process Overview
-
-The process of converting manual annotations (numbered/alphabetical indicators with connected descriptions) to Figma's native annotations:
-
-1. Get selected frame/component information
-2. Scan and collect all annotation text nodes
-3. Scan target UI elements (components, instances, frames)
-4. Match annotations to appropriate UI elements
-5. Apply native Figma annotations
-
-## Step 1: Get Selection and Initial Setup
-
-First, get the selected frame or component that contains annotations:
-
-\`\`\`typescript
-// Get the selected frame/component
-const selection = await get_selection();
-const selectedNodeId = selection[0].id
-
-// Get available annotation categories for later use
-const annotationData = await get_annotations({
-  nodeId: selectedNodeId,
-  includeCategories: true
-});
-const categories = annotationData.categories;
-\`\`\`
-
-## Step 2: Scan Annotation Text Nodes
-
-Scan all text nodes to identify annotations and their descriptions:
-
-\`\`\`typescript
-// Get all text nodes in the selection
-const textNodes = await scan_text_nodes({
-  nodeId: selectedNodeId
-});
-
-// Filter and group annotation markers and descriptions
-
-// Markers typically have these characteristics:
-// - Short text content (usually single digit/letter)
-// - Specific font styles (often bold)
-// - Located in a container with "Marker" or "Dot" in the name
-// - Have a clear naming pattern (e.g., "1", "2", "3" or "A", "B", "C")
-
-
-// Identify description nodes
-// Usually longer text nodes near markers or with matching numbers in path
-  
-\`\`\`
-
-## Step 3: Scan Target UI Elements
-
-Get all potential target elements that annotations might refer to:
-
-\`\`\`typescript
-// Scan for all UI elements that could be annotation targets
-const targetNodes = await scan_nodes_by_types({
-  nodeId: selectedNodeId,
-  types: [
-    "COMPONENT",
-    "INSTANCE",
-    "FRAME"
-  ]
-});
-\`\`\`
-
-## Step 4: Match Annotations to Targets
-
-Match each annotation to its target UI element using these strategies in order of priority:
-
-1. **Path-Based Matching**:
-   - Look at the marker's parent container name in the Figma layer hierarchy
-   - Remove any "Marker:" or "Annotation:" prefixes from the parent name
-   - Find UI elements that share the same parent name or have it in their path
-   - This works well when markers are grouped with their target elements
-
-2. **Name-Based Matching**:
-   - Extract key terms from the annotation description
-   - Look for UI elements whose names contain these key terms
-   - Consider both exact matches and semantic similarities
-   - Particularly effective for form fields, buttons, and labeled components
-
-3. **Proximity-Based Matching** (fallback):
-   - Calculate the center point of the marker
-   - Find the closest UI element by measuring distances to element centers
-   - Consider the marker's position relative to nearby elements
-   - Use this method when other matching strategies fail
-
-Additional Matching Considerations:
-- Give higher priority to matches found through path-based matching
-- Consider the type of UI element when evaluating matches
-- Take into account the annotation's context and content
-- Use a combination of strategies for more accurate matching
-
-## Step 5: Apply Native Annotations
-
-Convert matched annotations to Figma's native annotations using batch processing:
-
-\`\`\`typescript
-// Prepare annotations array for batch processing
-const annotationsToApply = Object.values(annotations).map(({ marker, description }) => {
-  // Find target using multiple strategies
-  const target = 
-    findTargetByPath(marker, targetNodes) ||
-    findTargetByName(description, targetNodes) ||
-    findTargetByProximity(marker, targetNodes);
-  
-  if (target) {
-    // Determine appropriate category based on content
-    const category = determineCategory(description.characters, categories);
-
-    // Determine appropriate additional annotationProperty based on content
-    const annotationProperty = determineProperties(description.characters, target.type);
-    
-    return {
-      nodeId: target.id,
-      labelMarkdown: description.characters,
-      categoryId: category.id,
-      properties: annotationProperty
-    };
-  }
-  return null;
-}).filter(Boolean); // Remove null entries
-
-// Apply annotations in batches using set_multiple_annotations
-if (annotationsToApply.length > 0) {
-  await set_multiple_annotations({
-    nodeId: selectedNodeId,
-    annotations: annotationsToApply
-  });
+type GapAxis = "vertical" | "horizontal" | "diagonal" | "overlap";
+
+interface GapMeasurement {
+  edgeGapPx: number;
+  horizontalGapPx: number;
+  verticalGapPx: number;
+  axis: GapAxis;
+  centerDistancePx: number;
+  centerDelta: { x: number; y: number };
+  /** When stacked/overlapping on X: signed vertical edge gap (B below A is positive). */
+  verticalEdgeFromAToBPx: number | null;
+  /** When stacked/overlapping on Y: signed horizontal edge gap (B right of A is positive). */
+  horizontalEdgeFromAToBPx: number | null;
 }
-\`\`\`
 
-
-This strategy focuses on practical implementation based on real-world usage patterns, emphasizing the importance of handling various UI elements as annotation targets, not just text nodes.`
-          },
-        },
-      ],
-      description: "Strategy for converting manual annotations to Figma's native annotations",
-    };
+function extractBoundingBox(node: Record<string, unknown>): BoundingBox | null {
+  const raw = node.absoluteBoundingBox as Record<string, unknown> | undefined;
+  if (
+    !raw ||
+    typeof raw.x !== "number" ||
+    typeof raw.y !== "number" ||
+    typeof raw.width !== "number" ||
+    typeof raw.height !== "number"
+  ) {
+    return null;
   }
-);
+  return { x: raw.x, y: raw.y, width: raw.width, height: raw.height };
+}
 
-// Instance Slot Filling Strategy Prompt
-figmaPrompt(
-  "swap_overrides_instances",
-  "Guide to swap instance overrides between instances",
-  (extra) => {
-    return {
-      messages: [
-        {
-          role: "assistant",
-          content: {
-            type: "text",
-            text: `# Swap Component Instance and Override Strategy
-
-## Overview
-This strategy enables transferring content and property overrides from a source instance to one or more target instances in Figma, maintaining design consistency while reducing manual work.
-
-## Step-by-Step Process
-
-### 1. Selection Analysis
-- Use \`get_selection()\` to identify the parent component or selected instances
-- For parent components, scan for instances with \`scan_nodes_by_types({ nodeId: "parent-id", types: ["INSTANCE"] })\`
-- Identify custom slots by name patterns (e.g. "Custom Slot*" or "Instance Slot") or by examining text content
-- Determine which is the source instance (with content to copy) and which are targets (where to apply content)
-
-### 2. Extract Source Overrides
-- Use \`get_instance_overrides()\` to extract customizations from the source instance
-- This captures text content, property values, and style overrides
-- Command syntax: \`get_instance_overrides({ nodeId: "source-instance-id" })\`
-- Look for successful response like "Got component information from [instance name]"
-
-### 3. Apply Overrides to Targets
-- Apply captured overrides using \`set_instance_overrides()\`
-- Command syntax:
-  \`\`\`
-  set_instance_overrides({
-    sourceInstanceId: "source-instance-id", 
-    targetNodeIds: ["target-id-1", "target-id-2", ...]
-  })
-  \`\`\`
-
-### 4. Verification
-- Verify results with \`get_node_info()\` or \`read_my_design()\`
-- Confirm text content and style overrides have transferred successfully
-
-## Key Tips
-- Always join the appropriate channel first with \`join_channel()\`
-- When working with multiple targets, check the full selection with \`get_selection()\`
-- Preserve component relationships by using instance overrides rather than direct text manipulation`,
-          },
-        },
-      ],
-      description: "Strategy for transferring overrides between component instances in Figma",
-    };
+function summarizeNodeBox(node: Record<string, unknown>): NodeBoxSummary {
+  const box = extractBoundingBox(node);
+  if (!box) {
+    throw new Error(`Node "${node.id}" (${node.name}) has no absoluteBoundingBox`);
   }
-);
+  return {
+    id: String(node.id),
+    name: String(node.name ?? ""),
+    type: String(node.type ?? ""),
+    box,
+    edges: {
+      top: box.y,
+      left: box.x,
+      right: box.x + box.width,
+      bottom: box.y + box.height,
+    },
+    center: {
+      x: box.x + box.width / 2,
+      y: box.y + box.height / 2,
+    },
+  };
+}
 
-// Set Layout Mode Tool
-figmaTool(
-  "set_layout_mode",
-  "Set the layout mode and wrap behavior of a frame in Figma",
-  {
-    nodeId: z.string().describe("The ID of the frame to modify"),
-    layoutMode: z.enum(["NONE", "HORIZONTAL", "VERTICAL"]).describe("Layout mode for the frame"),
-    layoutWrap: z.enum(["NO_WRAP", "WRAP"]).optional().describe("Whether the auto-layout frame wraps its children")
-  },
-  async ({ nodeId, layoutMode, layoutWrap }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_layout_mode", {
-        nodeId,
-        layoutMode,
-        layoutWrap: layoutWrap || "NO_WRAP"
-      });
-      const typedResult = result as { name: string };
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Set layout mode of frame "${typedResult.name}" to ${layoutMode}${layoutWrap ? ` with ${layoutWrap}` : ''}`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting layout mode: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-      };
-    }
+function measureGapBetween(boxA: BoundingBox, boxB: BoundingBox): GapMeasurement {
+  const aL = boxA.x;
+  const aT = boxA.y;
+  const aR = boxA.x + boxA.width;
+  const aB = boxA.y + boxA.height;
+  const bL = boxB.x;
+  const bT = boxB.y;
+  const bR = boxB.x + boxB.width;
+  const bB = boxB.y + boxB.height;
+
+  const horizontalGapPx = Math.max(0, Math.max(aL - bR, bL - aR));
+  const verticalGapPx = Math.max(0, Math.max(aT - bB, bT - aB));
+
+  let axis: GapAxis;
+  let edgeGapPx: number;
+  if (horizontalGapPx === 0 && verticalGapPx === 0) {
+    axis = "overlap";
+    edgeGapPx = 0;
+  } else if (horizontalGapPx === 0) {
+    axis = "vertical";
+    edgeGapPx = verticalGapPx;
+  } else if (verticalGapPx === 0) {
+    axis = "horizontal";
+    edgeGapPx = horizontalGapPx;
+  } else {
+    axis = "diagonal";
+    edgeGapPx = Math.hypot(horizontalGapPx, verticalGapPx);
   }
-);
 
-// Set Padding Tool
-figmaTool(
-  "set_padding",
-  "Set padding values for an auto-layout frame in Figma",
-  {
-    nodeId: z.string().describe("The ID of the frame to modify"),
-    paddingTop: z.number().optional().describe("Top padding value"),
-    paddingRight: z.number().optional().describe("Right padding value"),
-    paddingBottom: z.number().optional().describe("Bottom padding value"),
-    paddingLeft: z.number().optional().describe("Left padding value"),
-  },
-  async ({ nodeId, paddingTop, paddingRight, paddingBottom, paddingLeft }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_padding", {
-        nodeId,
-        paddingTop,
-        paddingRight,
-        paddingBottom,
-        paddingLeft,
-      });
-      const typedResult = result as { name: string };
+  const centerA = { x: boxA.x + boxA.width / 2, y: boxA.y + boxA.height / 2 };
+  const centerB = { x: boxB.x + boxB.width / 2, y: boxB.y + boxB.height / 2 };
+  const centerDelta = { x: centerB.x - centerA.x, y: centerB.y - centerA.y };
 
-      // Create a message about which padding values were set
-      const paddingMessages = [];
-      if (paddingTop !== undefined) paddingMessages.push(`top: ${paddingTop}`);
-      if (paddingRight !== undefined) paddingMessages.push(`right: ${paddingRight}`);
-      if (paddingBottom !== undefined) paddingMessages.push(`bottom: ${paddingBottom}`);
-      if (paddingLeft !== undefined) paddingMessages.push(`left: ${paddingLeft}`);
+  const verticalEdgeFromAToBPx =
+    horizontalGapPx === 0 ? Math.round((bT - aB) * 100) / 100 : null;
+  const horizontalEdgeFromAToBPx =
+    verticalGapPx === 0 ? Math.round((bL - aR) * 100) / 100 : null;
 
-      const paddingText = paddingMessages.length > 0
-        ? `padding (${paddingMessages.join(', ')})`
-        : "padding";
+  return {
+    edgeGapPx: Math.round(edgeGapPx * 100) / 100,
+    horizontalGapPx: Math.round(horizontalGapPx * 100) / 100,
+    verticalGapPx: Math.round(verticalGapPx * 100) / 100,
+    axis,
+    centerDistancePx: Math.round(Math.hypot(centerDelta.x, centerDelta.y) * 100) / 100,
+    centerDelta: {
+      x: Math.round(centerDelta.x * 100) / 100,
+      y: Math.round(centerDelta.y * 100) / 100,
+    },
+    verticalEdgeFromAToBPx,
+    horizontalEdgeFromAToBPx,
+  };
+}
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Set ${paddingText} for frame "${typedResult.name}"`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting padding: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Set Axis Align Tool
-figmaTool(
-  "set_axis_align",
-  "Set primary and counter axis alignment for an auto-layout frame in Figma",
-  {
-    nodeId: z.string().describe("The ID of the frame to modify"),
-    primaryAxisAlignItems: z
-      .enum(["MIN", "MAX", "CENTER", "SPACE_BETWEEN"])
-      .optional()
-      .describe("Primary axis alignment (MIN/MAX = left/right in horizontal, top/bottom in vertical). Note: When set to SPACE_BETWEEN, itemSpacing will be ignored as children will be evenly spaced."),
-    counterAxisAlignItems: z
-      .enum(["MIN", "MAX", "CENTER", "BASELINE"])
-      .optional()
-      .describe("Counter axis alignment (MIN/MAX = top/bottom in horizontal, left/right in vertical)")
-  },
-  async ({ nodeId, primaryAxisAlignItems, counterAxisAlignItems }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_axis_align", {
-        nodeId,
-        primaryAxisAlignItems,
-        counterAxisAlignItems
-      });
-      const typedResult = result as { name: string };
-
-      // Create a message about which alignments were set
-      const alignMessages = [];
-      if (primaryAxisAlignItems !== undefined) alignMessages.push(`primary: ${primaryAxisAlignItems}`);
-      if (counterAxisAlignItems !== undefined) alignMessages.push(`counter: ${counterAxisAlignItems}`);
-
-      const alignText = alignMessages.length > 0
-        ? `axis alignment (${alignMessages.join(', ')})`
-        : "axis alignment";
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Set ${alignText} for frame "${typedResult.name}"`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting axis alignment: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Set Layout Sizing Tool
-figmaTool(
-  "set_layout_sizing",
-  "Set horizontal and vertical sizing modes for an auto-layout frame in Figma",
-  {
-    nodeId: z.string().describe("The ID of the frame to modify"),
-    layoutSizingHorizontal: z
-      .enum(["FIXED", "HUG", "FILL"])
-      .optional()
-      .describe("Horizontal sizing mode (HUG for frames/text only, FILL for auto-layout children only)"),
-    layoutSizingVertical: z
-      .enum(["FIXED", "HUG", "FILL"])
-      .optional()
-      .describe("Vertical sizing mode (HUG for frames/text only, FILL for auto-layout children only)")
-  },
-  async ({ nodeId, layoutSizingHorizontal, layoutSizingVertical }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_layout_sizing", {
-        nodeId,
-        layoutSizingHorizontal,
-        layoutSizingVertical
-      });
-      const typedResult = result as { name: string };
-
-      // Create a message about which sizing modes were set
-      const sizingMessages = [];
-      if (layoutSizingHorizontal !== undefined) sizingMessages.push(`horizontal: ${layoutSizingHorizontal}`);
-      if (layoutSizingVertical !== undefined) sizingMessages.push(`vertical: ${layoutSizingVertical}`);
-
-      const sizingText = sizingMessages.length > 0
-        ? `layout sizing (${sizingMessages.join(', ')})`
-        : "layout sizing";
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Set ${sizingText} for frame "${typedResult.name}"`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting layout sizing: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Set Item Spacing Tool
-figmaTool(
-  "set_item_spacing",
-  "Set distance between children in an auto-layout frame",
-  {
-    nodeId: z.string().describe("The ID of the frame to modify"),
-    itemSpacing: z.number().optional().describe("Distance between children. Note: This value will be ignored if primaryAxisAlignItems is set to SPACE_BETWEEN."),
-    counterAxisSpacing: z.number().optional().describe("Distance between wrapped rows/columns. Only works when layoutWrap is set to WRAP.")
-  },
-  async ({ nodeId, itemSpacing, counterAxisSpacing}: any) => {
-    try {
-      const params: any = { nodeId };
-      if (itemSpacing !== undefined) params.itemSpacing = itemSpacing;
-      if (counterAxisSpacing !== undefined) params.counterAxisSpacing = counterAxisSpacing;
-      
-      const result = await sendCommandToFigma("set_item_spacing", params);
-      const typedResult = result as { name: string, itemSpacing?: number, counterAxisSpacing?: number };
-
-      let message = `Updated spacing for frame "${typedResult.name}":`;
-      if (itemSpacing !== undefined) message += ` itemSpacing=${itemSpacing}`;
-      if (counterAxisSpacing !== undefined) message += ` counterAxisSpacing=${counterAxisSpacing}`;
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: message,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting spacing: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Create Connectors Tool
-figmaTool(
-  "set_default_connector",
-  "Set a copied connector node as the default connector",
-  {
-    connectorId: z.string().optional().describe("The ID of the connector node to set as default")
-  },
-  async ({ connectorId }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_default_connector", {
-        connectorId
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Default connector set: ${JSON.stringify(result)}`
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting default connector: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ]
-      };
-    }
-  }
-);
-
-// Connect Nodes Tool
-figmaTool(
-  "create_connections",
-  "Create connections between nodes using the default connector style",
-  {
-    connections: z.array(z.object({
-      startNodeId: z.string().describe("ID of the starting node"),
-      endNodeId: z.string().describe("ID of the ending node"),
-      text: z.string().optional().describe("Optional text to display on the connector")
-    })).describe("Array of node connections to create")
-  },
-  async ({ connections }: any) => {
-    try {
-      if (!connections || connections.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "No connections provided"
-            }
-          ]
-        };
-      }
-
-      const result = await sendCommandToFigma("create_connections", {
-        connections
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Created ${connections.length} connections: ${JSON.stringify(result)}`
-          }
-        ]
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error creating connections: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ]
-      };
-    }
-  }
-);
-
-// Set Focus Tool
-figmaTool(
-  "set_focus",
-  "Set focus on a specific node in Figma by selecting it and scrolling viewport to it",
-  {
-    nodeId: z.string().describe("The ID of the node to focus on"),
-  },
-  async ({ nodeId }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_focus", { nodeId });
-      const typedResult = result as { name: string; id: string };
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Focused on node "${typedResult.name}" (ID: ${typedResult.id})`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting focus: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Set Selections Tool
-figmaTool(
-  "set_selections",
-  "Set selection to multiple nodes in Figma and scroll viewport to show them",
-  {
-    nodeIds: z.array(z.string()).describe("Array of node IDs to select"),
-  },
-  async ({ nodeIds }: any) => {
-    try {
-      const result = await sendCommandToFigma("set_selections", { nodeIds });
-      const typedResult = result as { selectedNodes: Array<{ name: string; id: string }>; count: number };
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Selected ${typedResult.count} nodes: ${typedResult.selectedNodes.map(node => `"${node.name}" (${node.id})`).join(', ')}`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error setting selections: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Define command types and parameters
 type FigmaCommand =
-  | "get_document_info"
-  | "get_selection"
   | "get_node_info"
   | "get_nodes_info"
-  | "read_my_design"
-  | "create_rectangle"
-  | "create_frame"
-  | "create_text"
-  | "set_fill_color"
-  | "set_stroke_color"
-  | "move_node"
-  | "resize_node"
-  | "delete_node"
-  | "delete_multiple_nodes"
-  | "get_styles"
-  | "get_local_components"
-  | "create_component_instance"
-  | "get_instance_overrides"
-  | "set_instance_overrides"
+  | "get_asset"
+  | "export_node_as_svg"
   | "export_node_as_image"
-  | "join"
-  | "set_corner_radius"
-  | "clone_node"
-  | "set_text_content"
-  | "scan_text_nodes"
-  | "set_multiple_text_contents"
-  | "get_annotations"
-  | "set_annotation"
-  | "set_multiple_annotations"
-  | "scan_nodes_by_types"
-  | "set_layout_mode"
-  | "set_padding"
-  | "set_axis_align"
-  | "set_layout_sizing"
-  | "set_item_spacing"
-  | "set_default_connector"
-  | "create_connections"
-  | "set_focus"
-  | "set_selections";
+  | "join";
 
 type CommandParams = {
-  get_document_info: Record<string, never>;
-  get_selection: Record<string, never>;
   get_node_info: { nodeId: string };
   get_nodes_info: { nodeIds: string[] };
-  create_rectangle: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-    name?: string;
-    parentId?: string;
-  };
-  create_frame: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-    name?: string;
-    parentId?: string;
-    fillColor?: { r: number; g: number; b: number; a?: number };
-    strokeColor?: { r: number; g: number; b: number; a?: number };
-    strokeWeight?: number;
-  };
-  create_text: {
-    x: number;
-    y: number;
-    text: string;
-    fontSize?: number;
-    fontWeight?: number;
-    fontColor?: { r: number; g: number; b: number; a?: number };
-    name?: string;
-    parentId?: string;
-  };
-  set_fill_color: {
-    nodeId: string;
-    r: number;
-    g: number;
-    b: number;
-    a?: number;
-  };
-  set_stroke_color: {
-    nodeId: string;
-    r: number;
-    g: number;
-    b: number;
-    a?: number;
-    weight?: number;
-  };
-  move_node: {
-    nodeId: string;
-    x: number;
-    y: number;
-  };
-  resize_node: {
-    nodeId: string;
-    width: number;
-    height: number;
-  };
-  delete_node: {
-    nodeId: string;
-  };
-  delete_multiple_nodes: {
-    nodeIds: string[];
-  };
-  get_styles: Record<string, never>;
-  get_local_components: Record<string, never>;
-  get_team_components: Record<string, never>;
-  create_component_instance: {
-    componentKey: string;
-    x: number;
-    y: number;
-  };
-  get_instance_overrides: {
-    instanceNodeId: string | null;
-  };
-  set_instance_overrides: {
-    targetNodeIds: string[];
-    sourceInstanceId: string;
-  };
-  export_node_as_image: {
-    nodeId: string;
-    format?: "PNG" | "JPG" | "SVG" | "PDF";
-    scale?: number;
-  };
-  execute_code: {
-    code: string;
-  };
-  join: {
-    channel: string;
-  };
-  set_corner_radius: {
-    nodeId: string;
-    radius: number;
-    corners?: boolean[];
-  };
-  clone_node: {
-    nodeId: string;
-    x?: number;
-    y?: number;
-  };
-  set_text_content: {
-    nodeId: string;
-    text: string;
-  };
-  scan_text_nodes: {
-    nodeId: string;
-    useChunking: boolean;
-    chunkSize: number;
-  };
-  set_multiple_text_contents: {
-    nodeId: string;
-    text: Array<{ nodeId: string; text: string }>;
-  };
-  get_annotations: {
-    nodeId?: string;
-    includeCategories?: boolean;
-  };
-  set_annotation: {
-    nodeId: string;
-    annotationId?: string;
-    labelMarkdown: string;
-    categoryId?: string;
-    properties?: Array<{ type: string }>;
-  };
-  set_multiple_annotations: SetMultipleAnnotationsParams;
-  scan_nodes_by_types: {
-    nodeId: string;
-    types: Array<string>;
-  };
-  set_default_connector: {
-    connectorId?: string | undefined;
-  };
-  create_connections: {
-    connections: Array<{
-      startNodeId: string;
-      endNodeId: string;
-      text?: string;
-    }>;
-  };
-  set_focus: {
-    nodeId: string;
-  };
-  set_selections: {
-    nodeIds: string[];
-  };
-
+  get_asset: { nodeIds: string[] };
+  export_node_as_svg: { nodeId: string };
+  export_node_as_image: { nodeId: string; scale?: number };
+  join: { channel: string; channel_description?: string };
 };
 
-
-// Helper function to process Figma node responses
-function processFigmaNodeResponse(result: unknown): any {
-  if (!result || typeof result !== "object") {
-    return result;
-  }
-
-  // Check if this looks like a node response
-  const resultObj = result as Record<string, unknown>;
-  if ("id" in resultObj && typeof resultObj.id === "string") {
-    // It appears to be a node response, log the details
-    console.info(
-      `Processed Figma node: ${resultObj.name || "Unknown"} (ID: ${resultObj.id
-      })`
-    );
-
-    if ("x" in resultObj && "y" in resultObj) {
-      console.debug(`Node position: (${resultObj.x}, ${resultObj.y})`);
-    }
-
-    if ("width" in resultObj && "height" in resultObj) {
-      console.debug(`Node dimensions: ${resultObj.width}×${resultObj.height}`);
-    }
-  }
-
-  return result;
-}
-
-// Update the connectToFigma function
 function connectToFigma(port: number = FIGMA_SOCKET_PORT) {
-  // If already connected, do nothing
   if (ws && ws.readyState === WebSocket.OPEN) {
-    logger.info('Already connected to Figma');
+    logger.info("Already connected to Figma");
     return;
   }
 
-  const wsUrl = serverUrl === 'localhost' ? `${WS_URL}:${port}` : WS_URL;
+  const wsUrl = serverUrl === "localhost" ? `${WS_URL}:${port}` : WS_URL;
   logger.info(`Connecting to Figma socket server at ${wsUrl}...`);
   ws = new WebSocket(wsUrl);
 
-  ws.on('open', () => {
-    logger.info('Connected to Figma socket server');
-    // After a relay drop, the MCP client gets a new WebSocket but must join the relay again.
-    // Keep currentChannel in memory across disconnect; re-join so Cursor does not stay "orphaned"
-    // until the user runs join_channel again (previously felt like a multi-second dead connection).
+  ws.on("open", () => {
+    logger.info("Connected to Figma socket server");
     const savedChannel = currentChannel;
     const savedDescription = currentChannelDescription;
     if (savedChannel) {
@@ -3056,20 +447,17 @@ function connectToFigma(port: number = FIGMA_SOCKET_PORT) {
     }
   });
 
-  ws.on("message", (data: any) => {
+  ws.on("message", (data: WebSocket.RawData) => {
     try {
-      // Define a more specific type with an index signature to allow any property access
       interface ProgressMessage {
-        message: FigmaResponse | any;
+        message: FigmaResponse | Record<string, unknown>;
         type?: string;
         id?: string;
-        channels?: Array<{ name: string; clientCount: number; description?: string }>;
-        [key: string]: any; // Allow any other properties
+        [key: string]: unknown;
       }
 
-      const json = JSON.parse(data) as ProgressMessage;
+      const json = JSON.parse(String(data)) as ProgressMessage;
 
-      // Relay-only: response to list_channels (no Figma plugin involved)
       if (json.type === "channel_list" && typeof json.id === "string" && pendingRequests.has(json.id)) {
         const request = pendingRequests.get(json.id)!;
         clearTimeout(request.timeout);
@@ -3078,105 +466,73 @@ function connectToFigma(port: number = FIGMA_SOCKET_PORT) {
         return;
       }
 
-      // Handle progress updates
-      if (json.type === 'progress_update') {
-        const progressData = json.message.data as CommandProgressUpdate;
-        const requestId = json.id || '';
+      if (json.type === "progress_update") {
+        const progressData = (json.message as { data?: CommandProgressUpdate }).data;
+        const requestId = json.id || "";
 
-        if (requestId && pendingRequests.has(requestId)) {
+        if (requestId && pendingRequests.has(requestId) && progressData) {
           const request = pendingRequests.get(requestId)!;
-
-          // Update last activity timestamp
           request.lastActivity = Date.now();
-
-          // Reset the timeout to prevent timeouts during long-running operations
           clearTimeout(request.timeout);
-
-          // Create a new timeout
           request.timeout = setTimeout(() => {
             if (pendingRequests.has(requestId)) {
-              logger.error(`Request ${requestId} timed out after extended period of inactivity`);
+              logger.error(`Request ${requestId} timed out after extended inactivity`);
               pendingRequests.delete(requestId);
-              request.reject(new Error('Request to Figma timed out'));
+              request.reject(new Error("Request to Figma timed out"));
             }
-          }, 60000); // 60 second timeout for inactivity
-
-          // Log progress
-          logger.info(`Progress update for ${progressData.commandType}: ${progressData.progress}% - ${progressData.message}`);
-
-          // For completed updates, we could resolve the request early if desired
-          if (progressData.status === 'completed' && progressData.progress === 100) {
-            // Optionally resolve early with partial data
-            // request.resolve(progressData.payload);
-            // pendingRequests.delete(requestId);
-
-            // Instead, just log the completion, wait for final result from Figma
-            logger.info(`Operation ${progressData.commandType} completed, waiting for final result`);
-          }
+          }, 60000);
+          logger.info(
+            `Progress for ${progressData.commandType}: ${progressData.progress}% - ${progressData.message}`
+          );
         }
         return;
       }
 
-      // Handle regular responses
-      const myResponse = json.message;
+      const myResponse = json.message as FigmaResponse;
       logger.debug(`Received message: ${JSON.stringify(myResponse)}`);
-      logger.log('myResponse' + JSON.stringify(myResponse));
 
-      // Handle response to a request
-      if (
-        myResponse.id &&
-        pendingRequests.has(myResponse.id) &&
-        myResponse.result
-      ) {
+      if (myResponse?.id && pendingRequests.has(myResponse.id)) {
         const request = pendingRequests.get(myResponse.id)!;
         clearTimeout(request.timeout);
 
         if (myResponse.error) {
           logger.error(`Error from Figma: ${myResponse.error}`);
           request.reject(new Error(myResponse.error));
-        } else {
-          if (myResponse.result) {
-            request.resolve(myResponse.result);
-          }
+        } else if (myResponse.result !== undefined) {
+          request.resolve(myResponse.result);
         }
 
         pendingRequests.delete(myResponse.id);
-      } else {
-        // Handle broadcast messages or events
+      } else if (myResponse) {
         logger.info(`Received broadcast message: ${JSON.stringify(myResponse)}`);
       }
     } catch (error) {
-      logger.error(`Error parsing message: ${error instanceof Error ? error.message : String(error)}`);
+      logger.error(
+        `Error parsing message: ${error instanceof Error ? error.message : String(error)}`
+      );
     }
   });
 
-  ws.on('error', (error) => {
+  ws.on("error", (error) => {
     logger.error(`Socket error: ${error}`);
   });
 
-  ws.on('close', () => {
-    logger.info('Disconnected from Figma socket server');
+  ws.on("close", () => {
+    logger.info("Disconnected from Figma socket server");
     ws = null;
 
-    // Reject all pending requests
     for (const [id, request] of pendingRequests.entries()) {
       clearTimeout(request.timeout);
       request.reject(new Error("Connection closed"));
       pendingRequests.delete(id);
     }
 
-    // Attempt to reconnect (skip for one-shot PNG CLI — process should exit)
-    if (!CLI_EXPORT_PNG_MODE) {
-      logger.info('Attempting to reconnect in 2 seconds...');
-      setTimeout(() => connectToFigma(port), 2000);
-    }
+    logger.info("Attempting to reconnect in 2 seconds...");
+    setTimeout(() => connectToFigma(port), 2000);
   });
 }
 
-/** Ask the WebSocket relay for channels that currently have at least one connected client. Does not require join_channel first. */
-function listActiveRelayChannels(timeoutMs: number = 10000): Promise<
-  Array<{ name: string; clientCount: number; description?: string }>
-> {
+function listActiveRelayChannels(timeoutMs: number = 10000): Promise<RelayChannel[]> {
   return new Promise((resolve, reject) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       connectToFigma();
@@ -3187,13 +543,11 @@ function listActiveRelayChannels(timeoutMs: number = 10000): Promise<
     const timeout = setTimeout(() => {
       if (pendingRequests.has(id)) {
         pendingRequests.delete(id);
-        reject(new Error("Request to list active channels timed out"));
+        reject(new Error("Request to list channels timed out"));
       }
     }, timeoutMs);
     pendingRequests.set(id, {
-      resolve: (value: unknown) => {
-        resolve(value as Array<{ name: string; clientCount: number; description?: string }>);
-      },
+      resolve: (value: unknown) => resolve(value as RelayChannel[]),
       reject,
       timeout,
       lastActivity: Date.now(),
@@ -3203,41 +557,62 @@ function listActiveRelayChannels(timeoutMs: number = 10000): Promise<
   });
 }
 
-// Function to join a channel
+function findChannelByDescription(
+  channels: RelayChannel[],
+  description: string
+): RelayChannel | null {
+  const needle = description.trim().toLowerCase();
+  if (!needle) return null;
+
+  const exact = channels.filter(
+    (c) => c.description?.trim().toLowerCase() === needle
+  );
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) {
+    throw new Error(
+      `Multiple channels match description "${description}": ${exact.map((c) => c.name).join(", ")}`
+    );
+  }
+
+  const partial = channels.filter((c) =>
+    c.description?.trim().toLowerCase().includes(needle)
+  );
+  if (partial.length === 1) return partial[0];
+  if (partial.length > 1) {
+    throw new Error(
+      `Multiple channels partially match "${description}": ${partial.map((c) => `${c.name} (${c.description})`).join("; ")}`
+    );
+  }
+
+  return null;
+}
+
 async function joinChannel(channelName: string, channelDescription?: string): Promise<void> {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     throw new Error("Not connected to Figma");
   }
 
-  try {
-    await sendCommandToFigma("join", {
-      channel: channelName,
-      channel_description: channelDescription,
-    });
-    currentChannel = channelName;
-    currentChannelDescription = channelDescription?.trim() || null;
-    logger.info(`Joined channel: ${channelName}`);
-  } catch (error) {
-    logger.error(`Failed to join channel: ${error instanceof Error ? error.message : String(error)}`);
-    throw error;
-  }
+  await sendCommandToFigma("join", {
+    channel: channelName,
+    channel_description: channelDescription,
+  });
+  currentChannel = channelName;
+  currentChannelDescription = channelDescription?.trim() || null;
+  logger.info(`Joined channel: ${channelName}`);
 }
 
-// Function to send commands to Figma
-function sendCommandToFigma(
-  command: FigmaCommand,
-  params: unknown = {},
+function sendCommandToFigma<T extends FigmaCommand>(
+  command: T,
+  params: CommandParams[T] = {} as CommandParams[T],
   timeoutMs: number = 30000
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    // If not connected, try to connect first
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       connectToFigma();
       reject(new Error("Not connected to Figma. Attempting to connect..."));
       return;
     }
 
-    // Check if we need a channel for this command
     const requiresChannel = command !== "join";
     if (requiresChannel && !currentChannel) {
       reject(new Error("Must join a channel before sending commands"));
@@ -3249,116 +624,38 @@ function sendCommandToFigma(
       id,
       type: command === "join" ? "join" : "message",
       ...(command === "join"
-        ? { channel: (params as any).channel }
+        ? { channel: (params as CommandParams["join"]).channel }
         : { channel: currentChannel }),
       message: {
         id,
         command,
         params: {
-          ...(params as any),
-          commandId: id, // Include the command ID in params
+          ...(params as Record<string, unknown>),
+          commandId: id,
         },
       },
     };
 
-    // Set timeout for request
     const timeout = setTimeout(() => {
       if (pendingRequests.has(id)) {
         pendingRequests.delete(id);
         logger.error(`Request ${id} to Figma timed out after ${timeoutMs / 1000} seconds`);
-        reject(new Error('Request to Figma timed out'));
+        reject(new Error("Request to Figma timed out"));
       }
     }, timeoutMs);
 
-    // Store the promise callbacks to resolve/reject later
     pendingRequests.set(id, {
       resolve,
       reject,
       timeout,
-      lastActivity: Date.now()
+      lastActivity: Date.now(),
     });
 
-    // Send the request
     logger.info(`Sending command to Figma: ${command}`);
     logger.debug(`Request details: ${JSON.stringify(request)}`);
     ws.send(JSON.stringify(request));
   });
 }
-
-figmaTool(
-  "get_active_channels",
-  "List WebSocket relay channels that currently have at least one connected client. Use after reconnecting or when the channel name is unknown, then call join_channel with a channel name from this list.",
-  {},
-  async () => {
-    try {
-      const channels = await listActiveRelayChannels();
-      const lines =
-        channels.length === 0
-          ? "No active channels (no clients connected to the relay, or relay unreachable)."
-          : [
-              "Active relay channels (name, connected client count, and optional description):",
-              ...channels.map((c) =>
-                `  - ${c.name} (${c.clientCount} client(s))${c.description ? ` - ${c.description}` : ""}`
-              ),
-              "",
-              "Call join_channel with one of the names above to pair with Figma on that channel.",
-            ].join("\n");
-      return {
-        content: [{ type: "text", text: lines }],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error listing active channels: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-      };
-    }
-  }
-);
-
-// Update the join_channel tool
-figmaTool(
-  "join_channel",
-  "Join a specific channel to communicate with Figma",
-  {
-    channel: z.string().describe("The channel to join").optional(),
-    channel_description: z.string().describe("Human-readable context for the channel").optional(),
-  },
-  async ({ channel, channel_description }: any) => {
-    try {
-      const normalizedChannel = typeof channel === "string" ? channel.trim() : "";
-      const normalizedDescription =
-        typeof channel_description === "string" ? channel_description.trim() : "";
-      const resolvedChannel = normalizedChannel || generateRandomChannelName();
-
-      await joinChannel(resolvedChannel, normalizedDescription || undefined);
-      const descriptionSuffix = normalizedDescription
-        ? ` (description: ${normalizedDescription})`
-        : "";
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Successfully joined channel: ${resolvedChannel}${descriptionSuffix}`,
-          },
-        ],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error joining channel: ${error instanceof Error ? error.message : String(error)
-              }`,
-          },
-        ],
-      };
-    }
-  }
-);
 
 function generateRandomChannelName(length: number = 8): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -3369,103 +666,525 @@ function generateRandomChannelName(length: number = 8): string {
   return result;
 }
 
-function waitUntilWebSocketOpen(timeoutMs: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (ws?.readyState === WebSocket.OPEN) {
-      resolve();
-      return;
-    }
-    if (!ws) {
-      reject(new Error("WebSocket not initialized"));
-      return;
-    }
-    const t = setTimeout(() => {
-      cleanup();
-      reject(new Error(`Timeout (${timeoutMs}ms) waiting for WebSocket connection`));
-    }, timeoutMs);
-    const onOpen = () => {
-      cleanup();
-      resolve();
-    };
-    const onErr = (err: Error) => {
-      cleanup();
-      reject(err);
-    };
-    function cleanup() {
-      clearTimeout(t);
-      ws?.off("open", onOpen);
-      ws?.off("error", onErr);
-    }
-    ws.once("open", onOpen);
-    ws.once("error", onErr);
-  });
-}
-
-async function runExportPngCli(opts: ExportPngCliOptions): Promise<void> {
-  connectToFigma(FIGMA_SOCKET_PORT);
-  await waitUntilWebSocketOpen(30_000);
-  await joinChannel(opts.channel);
-  await new Promise((r) => setTimeout(r, 400));
-  const result = (await sendCommandToFigma(
-    "export_node_as_image",
-    {
-      nodeId: opts.nodeId,
-      format: "PNG",
-      scale: opts.scale,
-    },
-    45_000
-  )) as { imageData?: string };
-  const b64 = result?.imageData;
-  if (!b64 || typeof b64 !== "string") {
-    throw new Error("export_node_as_image returned no imageData");
-  }
-  const abs = resolveWritePathUnderCwd(opts.outRel);
-  const buf = Buffer.from(b64, "base64");
-  fs.mkdirSync(path.dirname(abs), { recursive: true });
-  fs.writeFileSync(abs, buf);
-  const rel = path.relative(process.cwd(), abs);
-  logger.info(`Wrote ${rel} (${buf.byteLength} bytes)`);
-}
-
-// Start the server
-async function main() {
-  if (EXPORT_PNG_CLI) {
+server.tool(
+  "list_channels",
+  "List all WebSocket relay channels that currently have at least one connected client. Each entry includes name, clientCount, and optional description (set when a client joins with channel_description). Use list_channels then join_channel with a matching description to connect automatically.",
+  {},
+  async () => {
     try {
-      await runExportPngCli(EXPORT_PNG_CLI);
-      process.exit(0);
+      const channels = await listActiveRelayChannels();
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ channels, count: channels.length }, null, 2),
+          },
+        ],
+      };
     } catch (error) {
-      logger.error(
-        `export-png CLI failed: ${error instanceof Error ? error.message : String(error)}`
-      );
-      process.exit(1);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error listing channels: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
     }
-    return;
   }
+);
 
+server.tool(
+  "join_channel",
+  "Join a WebSocket relay channel to communicate with the Figma plugin. Omit channel and pass channel_description to auto-join the single matching channel from list_channels.",
+  {
+    channel: z.string().describe("The channel name to join").optional(),
+    channel_description: z
+      .string()
+      .describe(
+        "Human-readable label for this session, or search term to auto-join an existing channel when channel is omitted"
+      )
+      .optional(),
+  },
+  async ({ channel, channel_description }) => {
+    try {
+      const normalizedChannel = typeof channel === "string" ? channel.trim() : "";
+      const normalizedDescription =
+        typeof channel_description === "string" ? channel_description.trim() : "";
+
+      let resolvedChannel = normalizedChannel;
+      let matchedByDescription = false;
+
+      if (!resolvedChannel && normalizedDescription) {
+        const channels = await listActiveRelayChannels();
+        const match = findChannelByDescription(channels, normalizedDescription);
+        if (!match) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  error: `No channel found matching description "${normalizedDescription}"`,
+                  availableChannels: channels,
+                }),
+              },
+            ],
+          };
+        }
+        resolvedChannel = match.name;
+        matchedByDescription = true;
+      }
+
+      if (!resolvedChannel) {
+        resolvedChannel = generateRandomChannelName();
+      }
+
+      await joinChannel(
+        resolvedChannel,
+        matchedByDescription ? undefined : normalizedDescription || undefined
+      );
+
+      const descriptionSuffix = normalizedDescription
+        ? ` (description: ${normalizedDescription})`
+        : "";
+      const autoSuffix = matchedByDescription ? " [auto-joined by description]" : "";
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Successfully joined channel: ${resolvedChannel}${descriptionSuffix}${autoSuffix}`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error joining channel: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "get_node_info",
+  "Get detailed information about a specific node in Figma. Omits child nodes with absoluteRenderBounds: null (unpainted); do not create HTML elements for those nodes.",
+  {
+    nodeId: figmaNodeIdField("The ID of the node to get information about"),
+  },
+  async ({ nodeId }) => {
+    try {
+      const result = await sendCommandToFigma("get_node_info", { nodeId });
+      const filtered = filterFigmaNode(result as Record<string, unknown>);
+      if (!filtered) {
+        throw new Error(`Node not found: ${nodeId}`);
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ nodeId, ...filtered }),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error getting node info: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "get_nodes_info",
+  "Get detailed information about multiple nodes in Figma. Omits nodes with absoluteRenderBounds: null (unpainted).",
+  {
+    nodeIds: figmaNodeIdArrayField("Array of node IDs to get information about"),
+  },
+  async ({ nodeIds }) => {
+    try {
+      const raw = await sendCommandToFigma("get_nodes_info", { nodeIds });
+      const entries = raw as { nodeId: string; document: Record<string, unknown> | null }[];
+      if (!Array.isArray(entries)) {
+        throw new Error("Unexpected response from Figma when fetching nodes");
+      }
+
+      const results = entries.map((e) => ({
+        nodeId: e.nodeId,
+        info: filterFigmaNode(e.document),
+      }));
+
+      const missing = nodeIds.filter(
+        (id) => !results.some((r) => r.nodeId === id && r.info !== null)
+      );
+      if (missing.length > 0) {
+        throw new Error(`Node(s) not found: ${missing.join(", ")}`);
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(results),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error getting nodes info: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "get_asset",
+  "Predict whether each Figma node is an exportable icon/asset. Returns filtered node objects with assetPrediction (0–100), isAsset (score >= 50), and exportTarget (deduplicated: one export per nested asset chain — prefers the nearest isAsset INSTANCE on the path from root to the deepest asset, else parent of a vector primitive, else the deepest asset). Scoring treats visible IMAGE fills (and gifRef animated GIFs) as raster assets. Also returns exportNodeIds at the response root.",
+  {
+    nodeIds: figmaNodeIdArrayField("Node IDs to classify as assets"),
+  },
+  async ({ nodeIds }) => {
+    try {
+      const raw = await sendCommandToFigma("get_asset", { nodeIds });
+      const entries = raw as {
+        nodeId: string;
+        document: Record<string, unknown> | null;
+        error?: string;
+      }[];
+
+      if (!Array.isArray(entries)) {
+        throw new Error("Unexpected response from Figma when fetching assets");
+      }
+
+      const missing = nodeIds.filter(
+        (id) => !entries.some((e) => e.nodeId === id)
+      );
+      if (missing.length > 0) {
+        throw new Error(`Node(s) not found: ${missing.join(", ")}`);
+      }
+
+      const notFound = entries.filter((e) => e.error || e.document === null);
+      if (notFound.length > 0) {
+        const ids = notFound.map((e) => e.nodeId).join(", ");
+        throw new Error(`Node(s) not found: ${ids}`);
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(entries),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error getting asset predictions: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "export_node_as_svg",
+  "Export a Figma node as SVG via exportAsync (SVG_STRING). Returns UTF-8 markup; optional writePath writes a .svg file. Use outputDir for a custom absolute or relative destination (e.g. project assets folder).",
+  {
+    nodeId: figmaNodeIdField("The ID of the node to export as SVG"),
+    writePath: exportWritePathField,
+    outputDir: exportOutputDirField,
+  },
+  async ({ nodeId, writePath, outputDir }) => {
+    try {
+      const raw = await sendCommandToFigma("export_node_as_svg", { nodeId });
+      const result = raw as { svg?: string; imageData?: string; mimeType?: string };
+      const parsed = parsePluginSvgPayload(result, nodeId);
+
+      if (parsed.ok === false) {
+        return {
+          content: [{ type: "text", text: parsed.message }],
+        };
+      }
+
+      const content: Array<
+        | { type: "text"; text: string }
+        | { type: "image"; data: string; mimeType: string }
+      > = [];
+
+      if (writePath) {
+        const w = writeSvgToPath(writePath, parsed.svg, outputDir);
+        content.push({
+          type: "text",
+          text: JSON.stringify({
+            nodeId,
+            writePath: w.writePath,
+            absolutePath: w.absolutePath,
+            outputDir: w.outputDir,
+            bytes: w.bytes,
+            message: `Wrote ${w.absolutePath} (${w.bytes} bytes, UTF-8).`,
+          }),
+        });
+      } else {
+        content.push({
+          type: "text",
+          text: JSON.stringify({
+            nodeId,
+            bytes: Buffer.byteLength(parsed.svg, "utf-8"),
+            message: `SVG export for node ${nodeId}.`,
+          }),
+        });
+      }
+
+      content.push({
+        type: "text",
+        text: parsed.svg,
+      });
+
+      return { content };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error exporting node as SVG: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "export_node_as_image",
+  "Export a Figma node as PNG via exportAsync. Returns base64 image data; optional writePath writes a .png file. Use outputDir for a custom absolute or relative destination (e.g. project assets folder).",
+  {
+    nodeId: figmaNodeIdField("The ID of the node to export as PNG"),
+    scale: z
+      .number()
+      .min(0.01)
+      .max(8)
+      .optional()
+      .default(1)
+      .describe("Export scale factor (2–4 typical for retina assets)."),
+    writePath: exportWritePathField,
+    outputDir: exportOutputDirField,
+  },
+  async ({ nodeId, scale, writePath, outputDir }) => {
+    try {
+      const raw = await sendCommandToFigma("export_node_as_image", { nodeId, scale });
+      const result = raw as {
+        imageData?: string;
+        mimeType?: string;
+        format?: string;
+        scale?: number;
+      };
+
+      if (!result.imageData) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No PNG payload for node ${nodeId}. Reload the dev plugin from this repo.`,
+            },
+          ],
+        };
+      }
+
+      const buf = Buffer.from(result.imageData, "base64");
+      if (buf.length < 4 || buf[0] !== 0x89 || buf[1] !== 0x50 || buf[2] !== 0x4e || buf[3] !== 0x47) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Export for ${nodeId} was not valid PNG data.`,
+            },
+          ],
+        };
+      }
+
+      const content: Array<
+        | { type: "text"; text: string }
+        | { type: "image"; data: string; mimeType: string }
+      > = [];
+
+      if (writePath) {
+        const w = writePngToPath(writePath, result.imageData, outputDir);
+        content.push({
+          type: "text",
+          text: JSON.stringify({
+            nodeId,
+            format: "PNG",
+            scale: result.scale ?? scale,
+            writePath: w.writePath,
+            absolutePath: w.absolutePath,
+            outputDir: w.outputDir,
+            bytes: w.bytes,
+            message: `Wrote ${w.absolutePath} (${w.bytes} bytes).`,
+          }),
+        });
+      } else {
+        content.push({
+          type: "text",
+          text: JSON.stringify({
+            nodeId,
+            format: "PNG",
+            scale: result.scale ?? scale,
+            bytes: buf.length,
+            message: `PNG export for node ${nodeId}.`,
+          }),
+        });
+        content.push({
+          type: "image",
+          data: result.imageData,
+          mimeType: result.mimeType ?? "image/png",
+        });
+      }
+
+      return { content };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error exporting node as PNG: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "measure_gap_between",
+  "Measure the edge-to-edge gap between two Figma nodes using their absoluteBoundingBox (works across any depth in the layer tree). Returns minimum edge gap, axis-aligned separation, center distance, and directional offsets from node A to node B.",
+  {
+    nodeIdA: figmaNodeIdField("First node (reference)"),
+    nodeIdB: figmaNodeIdField("Second node"),
+  },
+  async ({ nodeIdA, nodeIdB }) => {
+    try {
+      if (nodeIdA === nodeIdB) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ error: "nodeIdA and nodeIdB must be different" }),
+            },
+          ],
+        };
+      }
+
+      const raw = await sendCommandToFigma("get_nodes_info", {
+        nodeIds: [nodeIdA, nodeIdB],
+      });
+
+      const entries = raw as { nodeId: string; document: Record<string, unknown> | null }[];
+      if (!Array.isArray(entries) || entries.length < 2) {
+        throw new Error("Unexpected response from Figma when fetching nodes");
+      }
+
+      const byId = new Map(entries.map((e) => [e.nodeId, e.document]));
+      const docA = byId.get(nodeIdA);
+      const docB = byId.get(nodeIdB);
+
+      if (!docA) {
+        throw new Error(`Node not found: ${nodeIdA}`);
+      }
+      if (!docB) {
+        throw new Error(`Node not found: ${nodeIdB}`);
+      }
+
+      const nodeA = summarizeNodeBox(docA);
+      const nodeB = summarizeNodeBox(docB);
+      const gap = measureGapBetween(nodeA.box, nodeB.box);
+
+      const payload = {
+        nodeA: {
+          id: nodeA.id,
+          name: nodeA.name,
+          type: nodeA.type,
+          absoluteBoundingBox: nodeA.box,
+          edges: nodeA.edges,
+          center: nodeA.center,
+        },
+        nodeB: {
+          id: nodeB.id,
+          name: nodeB.name,
+          type: nodeB.type,
+          absoluteBoundingBox: nodeB.box,
+          edges: nodeB.edges,
+          center: nodeB.center,
+        },
+        gap,
+        summary:
+          gap.axis === "overlap"
+            ? "Nodes overlap (0px edge gap)."
+            : gap.axis === "vertical" && gap.verticalEdgeFromAToBPx !== null
+              ? `${gap.edgeGapPx}px vertical edge gap (${nodeB.name} is ${gap.verticalEdgeFromAToBPx >= 0 ? "below" : "above"} ${nodeA.name}).`
+              : gap.axis === "horizontal" && gap.horizontalEdgeFromAToBPx !== null
+                ? `${gap.edgeGapPx}px horizontal edge gap (${nodeB.name} is ${gap.horizontalEdgeFromAToBPx >= 0 ? "right of" : "left of"} ${nodeA.name}).`
+                : `${gap.edgeGapPx}px minimum edge gap (${gap.axis}).`,
+      };
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(payload, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error measuring gap: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+async function main() {
   try {
-    // Try to connect to Figma socket server
     connectToFigma();
   } catch (error) {
-    logger.warn(`Could not connect to Figma initially: ${error instanceof Error ? error.message : String(error)}`);
-    logger.warn('Will try to connect when the first command is sent');
+    logger.warn(
+      `Could not connect to Figma initially: ${error instanceof Error ? error.message : String(error)}`
+    );
+    logger.warn("Will try to connect when the first command is sent");
   }
 
-  // Start the MCP server with stdio transport
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  logger.info("FigmaMCP server running on stdio");
-  if (CLIENT_CONNECTION_MODE === "read-only") {
-    logger.info(
-      "Connection mode: read-only (mutation tools and write-focused prompts omitted)"
-    );
-  }
+  logger.info(
+    "TalkToFigmaMCP v2 running on stdio (tools: list_channels, join_channel, get_node_info, get_nodes_info, get_asset, export_node_as_svg, export_node_as_image, measure_gap_between)"
+  );
 }
 
-// Run the server
-main().catch(error => {
-  logger.error(`Error starting FigmaMCP server: ${error instanceof Error ? error.message : String(error)}`);
+main().catch((error) => {
+  logger.error(
+    `Error starting FigmaMCP server: ${error instanceof Error ? error.message : String(error)}`
+  );
   process.exit(1);
 });
-
-
-

@@ -36,7 +36,8 @@ Runs inside Figma. `code.js` is the plugin main thread handling 30+ commands via
 
 ## Key Patterns
 
-- **Icon / illustration export (SVG vs PNG)**: Try **`export_node_as_svg`** first (optional **`writePath`** to save a `.svg` file). **Use `.svg`** only if the subtree has **fewer than 3** vector primitives (`VECTOR`, `ELLIPSE`, `STAR`, `LINE`, `POLYGON`, `BOOLEAN_OPERATION`) **and** the decoded SVG is **≤ 8 KB** UTF-8. Otherwise use **`export_node_as_image`** **`format: "PNG"`** (e.g. `scale: 2`–`4`), optional **`writePath`**, or the **`--export-png`** CLI on the MCP binary (quote node ids with `;` in the shell).
+- **Icon / illustration export (SVG vs PNG)**: Try **`export_node_as_svg`** first (optional **`writePath`** + **`outputDir`** to save a `.svg` file). **Use `.svg`** only if the subtree has **fewer than 3** vector primitives (`VECTOR`, `ELLIPSE`, `STAR`, `LINE`, `POLYGON`, `BOOLEAN_OPERATION`) **and** the decoded SVG is **≤ 8 KB** UTF-8. Otherwise use **`export_node_as_image`** (e.g. `scale: 2`–`4`) with **`writePath`** / **`outputDir`**. **`outputDir`** accepts an absolute path or a path relative to the MCP server cwd so assets land in the project folder instead of the server’s default cwd.
+- **HTML from Figma nodes**: Skip any node with **`absoluteRenderBounds: null`** — it does not paint on the canvas. `get_node_info` filters these out of the tree.
 - **Colors**: Figma uses RGBA 0-1 range. The MCP tools accept 0-1 floats and the filter converts to hex for display.
 - **Logging**: All logs go to stderr. Stdout is reserved for MCP protocol messages.
 - **Timeouts**: 30s default per command. Progress updates from the plugin reset the inactivity timer.

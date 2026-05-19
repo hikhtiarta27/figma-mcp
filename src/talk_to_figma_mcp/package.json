@@ -1,7 +1,7 @@
 {
-  "name": "talk-to-figma-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for Figma integration",
+  "name": "talk-to-figma-mcp-v2",
+  "version": "2.0.0",
+  "description": "Minimal MCP server for Figma — node info only",
   "main": "server.ts",
   "type": "module",
   "scripts": {
