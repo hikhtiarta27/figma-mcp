@@ -417,6 +417,169 @@ type CommandParams = {
   join: { channel: string; channel_description?: string };
 };
 
+const OFFICIAL_FIGMA_ATTRIBUTE_DEFINITIONS = {
+  source: {
+    provider: "Figma official docs",
+    restNodeTypes: "https://developers.figma.com/docs/rest-api/file-node-types/",
+    restFileEndpoints: "https://developers.figma.com/docs/rest-api/file-endpoints/",
+    pluginNodeProperties: "https://developers.figma.com/docs/plugins/api/node-properties/",
+    restApiSpecTypes:
+      "https://github.com/figma/rest-api-spec/blob/main/dist/api_types.ts",
+  },
+  scope:
+    "Common node attributes relevant to this MCP server output (get_node_info/get_nodes_info/read_my_design/get_asset).",
+  attributes: [
+    {
+      name: "id",
+      type: "string",
+      docs: "Node identifier from the REST node object.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "name",
+      type: "string",
+      docs: "Layer name.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "type",
+      type: "string",
+      docs: "Node type enum (FRAME, TEXT, VECTOR, etc.).",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "absoluteBoundingBox",
+      type: "Rectangle | null",
+      docs: "Bounding box in absolute space coordinates.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "absoluteRenderBounds",
+      type: "Rectangle | null",
+      docs: "Render bounds including effects/strokes; null when invisible.",
+      reference: "restApiSpecTypes",
+    },
+    {
+      name: "opacity",
+      type: "number",
+      docs: "Layer opacity.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "cornerRadius",
+      type: "number | mixed | null",
+      docs: "Corner radius information for corner-capable nodes.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "fills",
+      type: "Paint[]",
+      docs: "Fill paints array.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "strokes",
+      type: "Paint[]",
+      docs: "Stroke paints array.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "characters",
+      type: "string",
+      docs: "Text content for TEXT nodes.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "style",
+      type: "TypeStyle",
+      docs: "Text style details for text nodes.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "constraints",
+      type: "LayoutConstraint",
+      docs: "Horizontal and vertical layout constraints.",
+      reference: "restApiSpecTypes",
+    },
+    {
+      name: "layoutMode",
+      type: "'NONE' | 'HORIZONTAL' | 'VERTICAL' | 'GRID'",
+      docs: "Whether the node uses auto-layout.",
+      reference: "pluginNodeProperties",
+    },
+    {
+      name: "layoutAlign",
+      type: "'INHERIT' | 'STRETCH' | 'MIN' | 'CENTER' | 'MAX'",
+      docs: "Cross-axis alignment for auto-layout children.",
+      reference: "restApiSpecTypes",
+    },
+    {
+      name: "layoutGrow",
+      type: "number (0 | 1)",
+      docs: "Primary-axis stretch behavior for auto-layout children.",
+      reference: "pluginNodeProperties",
+    },
+    {
+      name: "layoutPositioning",
+      type: "enum",
+      docs: "Positioning mode for auto-layout children.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "layoutSizingHorizontal",
+      type: "'FIXED' | 'HUG' | 'FILL'",
+      docs: "Horizontal sizing behavior in auto-layout.",
+      reference: "pluginNodeProperties",
+    },
+    {
+      name: "layoutSizingVertical",
+      type: "'FIXED' | 'HUG' | 'FILL'",
+      docs: "Vertical sizing behavior in auto-layout.",
+      reference: "pluginNodeProperties",
+    },
+    {
+      name: "layoutWrap",
+      type: "enum",
+      docs: "Wrap behavior for auto-layout.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "clipsContent",
+      type: "boolean",
+      docs: "Whether a container clips overflow.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "blendMode",
+      type: "enum",
+      docs: "Layer blend mode.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "rectangleCornerRadii",
+      type: "number[]",
+      docs: "Per-corner radii.",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "effects",
+      type: "Effect[]",
+      docs: "Visual effects (drop shadow, blur, etc.).",
+      reference: "restNodeTypes",
+    },
+    {
+      name: "paddingLeft|paddingRight|paddingTop|paddingBottom",
+      type: "number",
+      docs: "Auto-layout container padding values.",
+      reference: "restNodeTypes",
+    },
+  ],
+  notes: [
+    "This tool returns canonical definitions from official docs; runtime payload shape may still be affected by MCP-side filtering.",
+    "For exhaustive per-node schemas, use the official Node Types docs and rest-api-spec type file.",
+  ],
+};
+
 function connectToFigma(port: number = FIGMA_SOCKET_PORT) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     logger.info("Already connected to Figma");
@@ -1073,6 +1236,22 @@ server.tool(
 );
 
 server.tool(
+  "get_attribute_definitions",
+  "Return official Figma attribute definitions (doc-backed) for common node fields used by this MCP server, with direct references to Figma docs.",
+  {},
+  async () => {
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(OFFICIAL_FIGMA_ATTRIBUTE_DEFINITIONS, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+server.tool(
   "measure_gap_between",
   "Measure the edge-to-edge gap between two Figma nodes using their absoluteBoundingBox (works across any depth in the layer tree). Returns minimum edge gap, axis-aligned separation, center distance, and directional offsets from node A to node B.",
   {
@@ -1178,7 +1357,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   logger.info(
-    "figma-mcp running on stdio (tools: list_channels, join_channel, get_node_info, get_nodes_info, get_asset, export_node_as_svg, export_node_as_image, measure_gap_between)"
+    "figma-mcp running on stdio (tools: list_channels, join_channel, get_node_info, get_nodes_info, get_asset, export_node_as_svg, export_node_as_image, get_attribute_definitions, measure_gap_between)"
   );
 }
 
