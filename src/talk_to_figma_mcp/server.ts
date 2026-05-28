@@ -219,6 +219,105 @@ function figmaNodeIdArrayField(description: string) {
     .describe(`${description} ${FIGMA_NODE_ID_FORMAT_HINT}`);
 }
 
+const getAssetInputPathField = z
+  .string()
+  .optional()
+  .describe(
+    "Path to a JSON file containing get_node_info/get_nodes_info output. Relative paths resolve from the MCP server cwd."
+  );
+
+function tryNormalizeFigmaNodeId(id: unknown): string | null {
+  if (typeof id !== "string") return null;
+  try {
+    return normalizeFigmaNodeId(id);
+  } catch {
+    return null;
+  }
+}
+
+function collectNodeIdsFromPayload(value: unknown, out: Set<string>): void {
+  if (value == null) return;
+
+  if (Array.isArray(value)) {
+    for (const item of value) collectNodeIdsFromPayload(item, out);
+    return;
+  }
+
+  if (typeof value !== "object") return;
+
+  const obj = value as Record<string, unknown>;
+  const directNodeId = tryNormalizeFigmaNodeId(obj.nodeId);
+  if (directNodeId) out.add(directNodeId);
+
+  const directId = tryNormalizeFigmaNodeId(obj.id);
+  if (directId) out.add(directId);
+
+  if (Array.isArray(obj.nodeIds)) {
+    for (const nodeId of obj.nodeIds) {
+      const normalized = tryNormalizeFigmaNodeId(nodeId);
+      if (normalized) out.add(normalized);
+    }
+  }
+
+  if (Array.isArray(obj.exportNodeIds)) {
+    for (const nodeId of obj.exportNodeIds) {
+      const normalized = tryNormalizeFigmaNodeId(nodeId);
+      if (normalized) out.add(normalized);
+    }
+  }
+
+  for (const nested of Object.values(obj)) {
+    collectNodeIdsFromPayload(nested, out);
+  }
+}
+
+function extractNodeIdsFromInputPath(inputPath: string): string[] {
+  const resolvedPath = path.isAbsolute(inputPath)
+    ? path.resolve(inputPath)
+    : path.resolve(process.cwd(), inputPath);
+  const raw = fs.readFileSync(resolvedPath, "utf-8");
+  const parsed = JSON.parse(raw) as unknown;
+
+  const candidates: unknown[] = [parsed];
+  const stack: unknown[] = [parsed];
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current || typeof current !== "object") continue;
+    const obj = current as Record<string, unknown>;
+
+    if (Array.isArray(obj.content)) {
+      for (const item of obj.content) {
+        if (item && typeof item === "object") {
+          const text = (item as Record<string, unknown>).text;
+          if (typeof text === "string") {
+            try {
+              const decoded = JSON.parse(text) as unknown;
+              candidates.push(decoded);
+              stack.push(decoded);
+            } catch {
+              // Ignore non-JSON text content.
+            }
+          }
+        }
+      }
+    }
+
+    for (const nested of Object.values(obj)) {
+      if (nested && typeof nested === "object") {
+        stack.push(nested);
+      }
+    }
+  }
+
+  const uniqueIds = new Set<string>();
+  for (const candidate of candidates) {
+    collectNodeIdsFromPayload(candidate, uniqueIds);
+  }
+
+  return [...uniqueIds];
+}
+
 let ws: WebSocket | null = null;
 const pendingRequests = new Map<
   string,
@@ -1016,13 +1115,24 @@ server.tool(
 
 server.tool(
   "get_asset",
-  "Predict whether each Figma node is an exportable icon/asset. Returns filtered node objects with assetPrediction (0–100), isAsset (score >= 50), and exportTarget (deduplicated: one export per nested asset chain — prefers the nearest isAsset INSTANCE on the path from root to the deepest asset, else parent of a vector primitive, else the deepest asset). Scoring treats visible IMAGE fills (and gifRef animated GIFs) as raster assets. Also returns exportNodeIds at the response root.",
+  "Predict whether each Figma node is an exportable icon/asset. Pass either nodeIds directly, or inputPath that points to JSON output from get_node_info/get_nodes_info so node IDs can be extracted automatically. Returns filtered node objects with assetPrediction (0–100), isAsset (score >= 50), and exportTarget (deduplicated: one export per nested asset chain — prefers the nearest isAsset INSTANCE on the path from root to the deepest asset, else parent of a vector primitive, else the deepest asset). Scoring treats visible IMAGE fills (and gifRef animated GIFs) as raster assets. Also returns exportNodeIds at the response root.",
   {
-    nodeIds: figmaNodeIdArrayField("Node IDs to classify as assets"),
+    nodeIds: figmaNodeIdArrayField("Node IDs to classify as assets").optional(),
+    inputPath: getAssetInputPathField,
   },
-  async ({ nodeIds }) => {
+  async ({ nodeIds, inputPath }) => {
     try {
-      const raw = await sendCommandToFigma("get_asset", { nodeIds });
+      let resolvedNodeIds = nodeIds ?? [];
+
+      if (resolvedNodeIds.length === 0 && inputPath) {
+        resolvedNodeIds = extractNodeIdsFromInputPath(inputPath);
+      }
+
+      if (resolvedNodeIds.length === 0) {
+        throw new Error("Provide either nodeIds or inputPath with parseable node ids");
+      }
+
+      const raw = await sendCommandToFigma("get_asset", { nodeIds: resolvedNodeIds });
       const entries = raw as {
         nodeId: string;
         document: Record<string, unknown> | null;
@@ -1033,7 +1143,7 @@ server.tool(
         throw new Error("Unexpected response from Figma when fetching assets");
       }
 
-      const missing = nodeIds.filter(
+      const missing = resolvedNodeIds.filter(
         (id) => !entries.some((e) => e.nodeId === id)
       );
       if (missing.length > 0) {
