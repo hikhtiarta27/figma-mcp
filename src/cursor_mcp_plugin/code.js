@@ -322,7 +322,6 @@ function rgbaToHex(color) {
 }
 
 function filterFigmaNode(node) {
-  // Unpainted nodes (opacity 0, outside clip, etc.) — omit from tree / HTML
   if (node.absoluteRenderBounds === null || node.opacity === 0) {
     return null;
   }
@@ -337,53 +336,26 @@ function filterFigmaNode(node) {
     absoluteRenderBounds: node.absoluteRenderBounds,
     characters: node.characters,
     style: node.style,
-    paddingLeft: node.paddingLeft,
-    paddingRight: node.paddingRight,
-    paddingTop: node.paddingTop,
-    paddingBottom: node.paddingBottom,
   };
 
-  if (typeof node.opacity === "number") {
-    filtered.opacity = node.opacity;
-  }
-
-  if (node.fills && node.fills.length > 0) {
-    filtered.fills = node.fills.map((fill) => {
-      var processedFill = Object.assign({}, fill);
-      delete processedFill.boundVariables;
-      delete processedFill.imageRef;
-
-      if (processedFill.gradientStops) {
-        processedFill.gradientStops = processedFill.gradientStops.map(
-          (stop) => {
-            var processedStop = Object.assign({}, stop);
-            if (processedStop.color) {
-              processedStop.color = rgbaToHex(processedStop.color);
-            }
-            delete processedStop.boundVariables;
-            return processedStop;
-          }
-        );
-      }
-
-      if (processedFill.color) {
-        processedFill.color = rgbaToHex(processedFill.color);
-      }
-
-      return processedFill;
-    });
-  }
-
-  if (node.strokes && node.strokes.length > 0) {
-    filtered.strokes = node.strokes.map((stroke) => {
-      var processedStroke = Object.assign({}, stroke);
-      delete processedStroke.boundVariables;
-      if (processedStroke.color) {
-        processedStroke.color = rgbaToHex(processedStroke.color);
-      }
-      return processedStroke;
-    });
-  }
+  if (node.paddingLeft) filtered.paddingLeft = node.paddingLeft
+  if (node.paddingRight) filtered.paddingRight = node.paddingRight
+  if (node.paddingTop) filtered.paddingTop = node.paddingTop
+  if (node.paddingBottom) filtered.paddingBottom = node.paddingBottom
+  if (node.effects) filtered.effects = node.effects
+  if (node.layoutAlign) filtered.layoutAlign = node.layoutAlign
+  if (node.layoutGrow) filtered.layoutGrow = node.layoutGrow
+  if (node.layoutMode) filtered.layoutMode = node.layoutMode
+  if (node.layoutPositioning) filtered.layoutPositioning = node.layoutPositioning
+  if (node.layoutSizingHorizontal) filtered.layoutSizingHorizontal = node.layoutSizingHorizontal
+  if (node.layoutSizingVertical) filtered.layoutSizingVertical = node.layoutSizingVertical
+  if (node.layoutWrap) filtered.layoutWrap = node.layoutWrap
+  if (node.fills && node.fills.length > 0) filtered.fills = node.fills
+  if (node.strokes && node.strokes.length > 0) filtered.strokes = node.strokes
+  if ("clipsContent" in node) filtered.clipsContent = node.clipsContent
+  if (node.blendMode) filtered.blendMode = node.blendMode
+  if (node.constraints) filtered.constraints = node.constraints
+  if (node.rectangleCornerRadii) filtered.rectangleCornerRadii = node.rectangleCornerRadii
 
   if (node.children) {
     filtered.children = node.children
