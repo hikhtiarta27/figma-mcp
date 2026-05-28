@@ -2,49 +2,98 @@
 
 import { Server, ServerWebSocket } from "bun";
 
-// Store clients by channel
-const channels = new Map<string, Set<ServerWebSocket<any>>>();
+type ClientRole = "mcp" | "plugin" | "unknown";
+
+interface ClientMeta {
+  role: ClientRole;
+  /** MCP client: session ids registered on this socket */
+  sessionIds: Set<string>;
+}
+
+interface ChannelState {
+  clients: Set<ServerWebSocket<unknown>>;
+  plugins: Set<ServerWebSocket<unknown>>;
+  /** Routes plugin responses to the MCP socket that owns the session */
+  mcpSessions: Map<string, ServerWebSocket<unknown>>;
+}
+
+/** request id → session (for plugin replies that omit sessionId) */
+const pendingRoutes = new Map<string, { channel: string; sessionId: string }>();
+
+const wsMeta = new WeakMap<ServerWebSocket<unknown>, ClientMeta>();
+const channels = new Map<string, ChannelState>();
 const channelDescriptions = new Map<string, string>();
 
-function handleConnection(ws: ServerWebSocket<any>) {
-  // Don't add to clients immediately - wait for channel join
-  console.log("New client connected");
+function getMeta(ws: ServerWebSocket<unknown>): ClientMeta {
+  let meta = wsMeta.get(ws);
+  if (!meta) {
+    meta = { role: "unknown", sessionIds: new Set() };
+    wsMeta.set(ws, meta);
+  }
+  return meta;
+}
 
-  // Send welcome message to the new client
-  ws.send(JSON.stringify({
+function getChannelState(channelName: string): ChannelState {
+  let state = channels.get(channelName);
+  if (!state) {
+    state = {
+      clients: new Set(),
+      plugins: new Set(),
+      mcpSessions: new Map(),
+    };
+    channels.set(channelName, state);
+  }
+  return state;
+}
+
+function removeClientFromChannels(ws: ServerWebSocket<unknown>) {
+  const meta = wsMeta.get(ws);
+  channels.forEach((state, channelName) => {
+    if (state.clients.has(ws)) {
+      state.clients.delete(ws);
+      state.plugins.delete(ws);
+      if (meta) {
+        for (const sessionId of meta.sessionIds) {
+          if (state.mcpSessions.get(sessionId) === ws) {
+            state.mcpSessions.delete(sessionId);
+          }
+        }
+      }
+      for (const [requestId, route] of pendingRoutes.entries()) {
+        if (route.channel === channelName && state.mcpSessions.get(route.sessionId) === ws) {
+          pendingRoutes.delete(requestId);
+        }
+      }
+    }
+  });
+  wsMeta.delete(ws);
+}
+
+function sendJson(ws: ServerWebSocket<unknown>, payload: unknown) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
+  }
+}
+
+function handleConnection(ws: ServerWebSocket<unknown>) {
+  console.log("New client connected");
+  getMeta(ws);
+
+  sendJson(ws, {
     type: "system",
     message: "Please join a channel to start chatting",
-  }));
+  });
 
   ws.close = () => {
     console.log("Client disconnected");
-
-    // Remove client from their channel
-    channels.forEach((clients, channelName) => {
-      if (clients.has(ws)) {
-        clients.delete(ws);
-
-        // Notify other clients in same channel
-        clients.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-              type: "system",
-              message: "A user has left the channel",
-              channel: channelName
-            }));
-          }
-        });
-      }
-    });
+    removeClientFromChannels(ws);
   };
 }
 
 const server = Bun.serve({
-  port: 3055,
-  // uncomment this to allow connections in windows wsl
-  // hostname: "0.0.0.0",
+  hostname: process.env.HOST || "0.0.0.0",
+  port: Number(process.env.PORT || "3055"),
   fetch(req: Request, server: Server) {
-    // Handle CORS preflight
     if (req.method === "OPTIONS") {
       return new Response(null, {
         headers: {
@@ -55,7 +104,6 @@ const server = Bun.serve({
       });
     }
 
-    // Handle WebSocket upgrade
     const success = server.upgrade(req, {
       headers: {
         "Access-Control-Allow-Origin": "*",
@@ -63,10 +111,9 @@ const server = Bun.serve({
     });
 
     if (success) {
-      return; // Upgraded to WebSocket
+      return;
     }
 
-    // Return response for non-WebSocket requests
     return new Response("WebSocket server running", {
       headers: {
         "Access-Control-Allow-Origin": "*",
@@ -75,32 +122,33 @@ const server = Bun.serve({
   },
   websocket: {
     open: handleConnection,
-    message(ws: ServerWebSocket<any>, message: string | Buffer) {
+    message(ws: ServerWebSocket<unknown>, message: string | Buffer) {
       try {
-        const data = JSON.parse(message as string);
-        console.log(`\n=== Received message from client ===`);
-        console.log(`Type: ${data.type}, Channel: ${data.channel || 'N/A'}`);
-        if (data.message?.command) {
-          console.log(`Command: ${data.message.command}, ID: ${data.id}`);
-        } else if (data.message?.result) {
-          console.log(`Response: ID: ${data.id}, Has Result: ${!!data.message.result}`);
-        }
-        console.log(`Full message:`, JSON.stringify(data, null, 2));
+        const data = JSON.parse(message as string) as Record<string, unknown>;
+        const meta = getMeta(ws);
 
-        // MCP / any client: list channels that have at least one open connection (no join required)
+        console.log(`\n=== Received message from client ===`);
+        console.log(`Type: ${data.type}, Channel: ${data.channel || "N/A"}`);
+        const inner = data.message as Record<string, unknown> | undefined;
+        if (inner?.command) {
+          console.log(`Command: ${inner.command}, ID: ${inner.id}`);
+        } else if (inner?.result !== undefined || inner?.error) {
+          console.log(`Response: ID: ${inner.id}, sessionId: ${inner.sessionId || data.sessionId || "N/A"}`);
+        }
+
         if (data.type === "list_channels") {
           const requestId = data.id;
           if (!requestId || typeof requestId !== "string") {
-            ws.send(JSON.stringify({
+            sendJson(ws, {
               type: "error",
               message: "list_channels requires a string id",
-            }));
+            });
             return;
           }
           const list: { name: string; clientCount: number; description?: string }[] = [];
-          for (const [name, clients] of channels) {
+          for (const [name, state] of channels) {
             let clientCount = 0;
-            for (const c of clients) {
+            for (const c of state.clients) {
               if (c.readyState === WebSocket.OPEN) clientCount++;
             }
             if (clientCount > 0) {
@@ -113,12 +161,49 @@ const server = Bun.serve({
             }
           }
           list.sort((a, b) => a.name.localeCompare(b.name));
-          ws.send(JSON.stringify({
+          sendJson(ws, {
             type: "channel_list",
             id: requestId,
             channels: list,
-          }));
+          });
           console.log(`\n✓ list_channels → ${list.length} active channel(s)`);
+          return;
+        }
+
+        if (data.type === "register_session") {
+          const channelName = data.channel;
+          const sessionId = data.sessionId;
+          if (
+            typeof channelName !== "string" ||
+            typeof sessionId !== "string" ||
+            !channelName.trim() ||
+            !sessionId.trim()
+          ) {
+            sendJson(ws, {
+              type: "error",
+              message: "register_session requires channel and sessionId",
+            });
+            return;
+          }
+          const state = getChannelState(channelName.trim());
+          if (!state.clients.has(ws)) {
+            sendJson(ws, {
+              type: "error",
+              message: "You must join the channel before registering a session",
+            });
+            return;
+          }
+          meta.role = "mcp";
+          meta.sessionIds.add(sessionId.trim());
+          state.mcpSessions.set(sessionId.trim(), ws);
+          console.log(
+            `\n✓ Registered MCP session "${sessionId}" on channel "${channelName}"`
+          );
+          sendJson(ws, {
+            type: "system",
+            message: { id: data.id, result: `Registered session ${sessionId}` },
+            channel: channelName,
+          });
           return;
         }
 
@@ -127,116 +212,215 @@ const server = Bun.serve({
           const channelDescription =
             typeof data.channel_description === "string"
               ? data.channel_description.trim()
-              : typeof data.message?.params?.channel_description === "string"
-                ? data.message.params.channel_description.trim()
+              : typeof (data.message as Record<string, unknown> | undefined)?.params === "object" &&
+                  (data.message as { params?: { channel_description?: string } }).params
+                    ?.channel_description === "string"
+                ? String(
+                    (data.message as { params: { channel_description: string } }).params
+                      .channel_description
+                  ).trim()
                 : "";
           if (!channelName || typeof channelName !== "string") {
-            ws.send(JSON.stringify({
-              type: "error",
-              message: "Channel name is required"
-            }));
+            sendJson(ws, { type: "error", message: "Channel name is required" });
             return;
           }
 
-          // Create channel if it doesn't exist
-          if (!channels.has(channelName)) {
-            channels.set(channelName, new Set());
+          const state = getChannelState(channelName);
+          state.clients.add(ws);
+
+          const joinSessionId =
+            typeof data.sessionId === "string" ? data.sessionId.trim() : "";
+          if (joinSessionId) {
+            meta.role = "mcp";
+            meta.sessionIds.add(joinSessionId);
+            state.mcpSessions.set(joinSessionId, ws);
+          } else {
+            meta.role = "plugin";
+            state.plugins.add(ws);
           }
+
           if (channelDescription) {
             channelDescriptions.set(channelName, channelDescription);
           }
 
-          // Add client to channel
-          const channelClients = channels.get(channelName)!;
-          channelClients.add(ws);
+          console.log(
+            `\n✓ Client joined channel "${channelName}" as ${meta.role} (${state.clients.size} clients)`
+          );
 
-          console.log(`\n✓ Client joined channel "${channelName}" (${channelClients.size} total clients)`);
-
-          // Notify client they joined successfully
-          ws.send(JSON.stringify({
+          sendJson(ws, {
             type: "system",
             message: `Joined channel: ${channelName}`,
-            channel: channelName
-          }));
+            channel: channelName,
+          });
 
-          ws.send(JSON.stringify({
+          sendJson(ws, {
             type: "system",
             message: {
               id: data.id,
               result: "Connected to channel: " + channelName,
             },
-            channel: channelName
-          }));
+            channel: channelName,
+          });
 
-          // Notify other clients in channel
-          channelClients.forEach((client) => {
+          state.clients.forEach((client) => {
             if (client !== ws && client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify({
+              sendJson(client, {
                 type: "system",
                 message: "A new user has joined the channel",
-                channel: channelName
-              }));
+                channel: channelName,
+              });
             }
           });
           return;
         }
 
-        // Handle regular messages
         if (data.type === "message") {
           const channelName = data.channel;
           if (!channelName || typeof channelName !== "string") {
-            ws.send(JSON.stringify({
-              type: "error",
-              message: "Channel name is required"
-            }));
+            sendJson(ws, { type: "error", message: "Channel name is required" });
             return;
           }
 
-          const channelClients = channels.get(channelName);
-          if (!channelClients || !channelClients.has(ws)) {
-            ws.send(JSON.stringify({
+          const state = getChannelState(channelName);
+          if (!state.clients.has(ws)) {
+            sendJson(ws, {
               type: "error",
-              message: "You must join the channel first"
-            }));
+              message: "You must join the channel first",
+            });
             return;
           }
 
-          // Broadcast to all OTHER clients in the channel (not the sender)
-          // This prevents echo and ensures proper request-response flow
+          const innerMessage = (data.message || {}) as Record<string, unknown>;
+          const sessionId =
+            (typeof data.sessionId === "string" && data.sessionId.trim()) ||
+            (typeof innerMessage.sessionId === "string" && innerMessage.sessionId.trim()) ||
+            "";
+
+          const isCommand = typeof innerMessage.command === "string";
+          const isResponse =
+            innerMessage.result !== undefined || typeof innerMessage.error === "string";
+
+          if (isCommand && sessionId) {
+            meta.role = "mcp";
+            meta.sessionIds.add(sessionId);
+            state.mcpSessions.set(sessionId, ws);
+            const requestId = typeof innerMessage.id === "string" ? innerMessage.id : "";
+            if (requestId) {
+              pendingRoutes.set(requestId, { channel: channelName, sessionId });
+            }
+
+            let sent = 0;
+            state.plugins.forEach((client) => {
+              if (client.readyState === WebSocket.OPEN) {
+                sent++;
+                sendJson(client, {
+                  type: "broadcast",
+                  message: innerMessage,
+                  sender: "peer",
+                  channel: channelName,
+                  sessionId,
+                });
+              }
+            });
+            if (sent === 0) {
+              console.log(
+                `⚠️  No Figma plugin in channel "${channelName}" for session "${sessionId}"`
+              );
+            } else {
+              console.log(
+                `✓ Routed command to ${sent} plugin(s) [session=${sessionId}, channel=${channelName}]`
+              );
+            }
+            return;
+          }
+
+          if (isResponse && sessionId) {
+            const requestId = typeof innerMessage.id === "string" ? innerMessage.id : "";
+            if (requestId) pendingRoutes.delete(requestId);
+
+            const targetWs = state.mcpSessions.get(sessionId);
+            if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+              sendJson(targetWs, {
+                type: "message",
+                channel: channelName,
+                sessionId,
+                message: innerMessage,
+              });
+              console.log(
+                `✓ Routed response to MCP session "${sessionId}" [request=${requestId}]`
+              );
+            } else {
+              console.log(`⚠️  No MCP client for session "${sessionId}"`);
+            }
+            return;
+          }
+
+          if (isResponse && !sessionId) {
+            const requestId = typeof innerMessage.id === "string" ? innerMessage.id : "";
+            const route = requestId ? pendingRoutes.get(requestId) : undefined;
+            const resolvedSessionId = route?.sessionId;
+            if (resolvedSessionId && route) {
+              pendingRoutes.delete(requestId);
+              const targetWs = state.mcpSessions.get(resolvedSessionId);
+              if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+                sendJson(targetWs, {
+                  type: "message",
+                  channel: channelName,
+                  sessionId: resolvedSessionId,
+                  message: { ...innerMessage, sessionId: resolvedSessionId },
+                });
+                console.log(
+                  `✓ Routed response via pending route to session "${resolvedSessionId}"`
+                );
+                return;
+              }
+            }
+          }
+
+          // Legacy: broadcast to all other clients in channel (no session isolation)
           let broadcastCount = 0;
-          channelClients.forEach((client) => {
+          state.clients.forEach((client) => {
             if (client !== ws && client.readyState === WebSocket.OPEN) {
               broadcastCount++;
-              const broadcastMessage = {
+              sendJson(client, {
                 type: "broadcast",
-                message: data.message,
+                message: innerMessage,
                 sender: "peer",
-                channel: channelName
-              };
-              console.log(`\n=== Broadcasting to peer #${broadcastCount} ===`);
-              console.log(JSON.stringify(broadcastMessage, null, 2));
-              client.send(JSON.stringify(broadcastMessage));
+                channel: channelName,
+              });
             }
           });
-          
           if (broadcastCount === 0) {
-            console.log(`⚠️  No other clients in channel "${channelName}" to receive message!`);
-          } else {
-            console.log(`✓ Broadcast to ${broadcastCount} peer(s) in channel "${channelName}"`);
+            console.log(`⚠️  No peers in channel "${channelName}" (legacy broadcast)`);
           }
+          return;
         }
 
-        // Forward progress_update messages to the MCP server so it can reset
         if (data.type === "progress_update") {
           const channelName = data.channel;
-          if (!channelName) return;
+          if (!channelName || typeof channelName !== "string") return;
 
-          const channelClients = channels.get(channelName);
-          if (!channelClients || !channelClients.has(ws)) return;
+          const state = getChannelState(channelName);
+          if (!state.clients.has(ws)) return;
 
-          channelClients.forEach((client) => {
+          const sessionId =
+            (typeof data.sessionId === "string" && data.sessionId.trim()) ||
+            (typeof (data.message as Record<string, unknown> | undefined)?.sessionId ===
+              "string" &&
+              String((data.message as { sessionId: string }).sessionId).trim()) ||
+            "";
+
+          if (sessionId) {
+            const targetWs = state.mcpSessions.get(sessionId);
+            if (targetWs && targetWs !== ws && targetWs.readyState === WebSocket.OPEN) {
+              sendJson(targetWs, data);
+            }
+            return;
+          }
+
+          state.clients.forEach((client) => {
             if (client !== ws && client.readyState === WebSocket.OPEN) {
-              client.send(JSON.stringify(data));
+              sendJson(client, data);
             }
           });
         }
@@ -244,22 +428,20 @@ const server = Bun.serve({
         console.error("Error handling message:", err);
       }
     },
-    close(ws: ServerWebSocket<any>) {
-      // Remove client from their channel
-      channels.forEach((clients) => {
-        clients.delete(ws);
-      });
-      for (const [channelName, clients] of channels.entries()) {
+    close(ws: ServerWebSocket<unknown>) {
+      removeClientFromChannels(ws);
+      for (const [channelName, state] of channels.entries()) {
         let openClientCount = 0;
-        for (const client of clients) {
+        for (const client of state.clients) {
           if (client.readyState === WebSocket.OPEN) openClientCount++;
         }
         if (openClientCount === 0) {
+          channels.delete(channelName);
           channelDescriptions.delete(channelName);
         }
       }
-    }
-  }
+    },
+  },
 });
 
 console.log(`WebSocket server running on port ${server.port}`);

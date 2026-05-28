@@ -318,7 +318,14 @@ function extractNodeIdsFromInputPath(inputPath: string): string[] {
   return [...uniqueIds];
 }
 
+interface FigmaSession {
+  sessionId: string;
+  channel: string;
+  channelDescription?: string;
+}
+
 let ws: WebSocket | null = null;
+const sessions = new Map<string, FigmaSession>();
 const pendingRequests = new Map<
   string,
   {
@@ -326,11 +333,24 @@ const pendingRequests = new Map<
     reject: (reason: unknown) => void;
     timeout: ReturnType<typeof setTimeout>;
     lastActivity: number;
+    sessionId: string | null;
   }
 >();
 
-let currentChannel: string | null = null;
-let currentChannelDescription: string | null = null;
+const sessionIdField = z
+  .string()
+  .uuid()
+  .describe(
+    "Session id returned by join_channel. Routes commands and responses so multiple users on the same channel do not receive each other's results."
+  );
+
+function getSession(sessionId: string): FigmaSession {
+  const session = sessions.get(sessionId);
+  if (!session) {
+    throw new Error(`Unknown sessionId "${sessionId}". Call join_channel first.`);
+  }
+  return session;
+}
 
 const server = new McpServer({
   name: "figma-mcp",
@@ -691,19 +711,21 @@ function connectToFigma(port: number = FIGMA_SOCKET_PORT) {
 
   ws.on("open", () => {
     logger.info("Connected to Figma socket server");
-    const savedChannel = currentChannel;
-    const savedDescription = currentChannelDescription;
-    if (savedChannel) {
+    for (const session of sessions.values()) {
       void (async () => {
         try {
-          await joinChannel(savedChannel, savedDescription || undefined);
-          logger.info(`Re-joined relay channel "${savedChannel}" after reconnect`);
+          await relayJoinChannel(
+            session.channel,
+            session.sessionId,
+            session.channelDescription
+          );
+          logger.info(
+            `Re-joined relay channel "${session.channel}" (session ${session.sessionId}) after reconnect`
+          );
         } catch (err) {
           logger.error(
-            `Failed to re-join channel after reconnect: ${err instanceof Error ? err.message : String(err)}`
+            `Failed to re-join session ${session.sessionId}: ${err instanceof Error ? err.message : String(err)}`
           );
-          currentChannel = null;
-          currentChannelDescription = null;
         }
       })();
     }
@@ -728,12 +750,22 @@ function connectToFigma(port: number = FIGMA_SOCKET_PORT) {
         return;
       }
 
+      const envelopeSessionId =
+        typeof json.sessionId === "string" ? json.sessionId : undefined;
+
       if (json.type === "progress_update") {
         const progressData = (json.message as { data?: CommandProgressUpdate }).data;
         const requestId = json.id || "";
 
         if (requestId && pendingRequests.has(requestId) && progressData) {
           const request = pendingRequests.get(requestId)!;
+          if (
+            envelopeSessionId &&
+            request.sessionId &&
+            request.sessionId !== envelopeSessionId
+          ) {
+            return;
+          }
           request.lastActivity = Date.now();
           clearTimeout(request.timeout);
           request.timeout = setTimeout(() => {
@@ -750,11 +782,22 @@ function connectToFigma(port: number = FIGMA_SOCKET_PORT) {
         return;
       }
 
-      const myResponse = json.message as FigmaResponse;
+      const myResponse = json.message as FigmaResponse & { sessionId?: string };
       logger.debug(`Received message: ${JSON.stringify(myResponse)}`);
+
+      const responseSessionId =
+        envelopeSessionId ||
+        (typeof myResponse?.sessionId === "string" ? myResponse.sessionId : undefined);
 
       if (myResponse?.id && pendingRequests.has(myResponse.id)) {
         const request = pendingRequests.get(myResponse.id)!;
+        if (
+          responseSessionId &&
+          request.sessionId &&
+          request.sessionId !== responseSessionId
+        ) {
+          return;
+        }
         clearTimeout(request.timeout);
 
         if (myResponse.error) {
@@ -813,6 +856,7 @@ function listActiveRelayChannels(timeoutMs: number = 10000): Promise<RelayChanne
       reject,
       timeout,
       lastActivity: Date.now(),
+      sessionId: null,
     });
     ws.send(JSON.stringify({ type: "list_channels", id }));
     logger.info("Sent list_channels to relay");
@@ -849,21 +893,49 @@ function findChannelByDescription(
   return null;
 }
 
-async function joinChannel(channelName: string, channelDescription?: string): Promise<void> {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    throw new Error("Not connected to Figma");
-  }
+function relayJoinChannel(
+  channelName: string,
+  sessionId: string,
+  channelDescription?: string
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      connectToFigma();
+      reject(new Error("Not connected to Figma relay. Attempting to connect..."));
+      return;
+    }
 
-  await sendCommandToFigma("join", {
-    channel: channelName,
-    channel_description: channelDescription,
+    const id = uuidv4();
+    const timeout = setTimeout(() => {
+      if (pendingRequests.has(id)) {
+        pendingRequests.delete(id);
+        reject(new Error("Join channel timed out"));
+      }
+    }, 30000);
+
+    pendingRequests.set(id, {
+      resolve: () => resolve(),
+      reject,
+      timeout,
+      lastActivity: Date.now(),
+      sessionId: null,
+    });
+
+    ws.send(
+      JSON.stringify({
+        id,
+        type: "join",
+        channel: channelName,
+        sessionId,
+        channel_description: channelDescription,
+      })
+    );
+    logger.info(`Joining relay channel "${channelName}" for session ${sessionId}`);
   });
-  currentChannel = channelName;
-  currentChannelDescription = channelDescription?.trim() || null;
-  logger.info(`Joined channel: ${channelName}`);
 }
 
 function sendCommandToFigma<T extends FigmaCommand>(
+  sessionId: string,
   command: T,
   params: CommandParams[T] = {} as CommandParams[T],
   timeoutMs: number = 30000
@@ -875,21 +947,17 @@ function sendCommandToFigma<T extends FigmaCommand>(
       return;
     }
 
-    const requiresChannel = command !== "join";
-    if (requiresChannel && !currentChannel) {
-      reject(new Error("Must join a channel before sending commands"));
-      return;
-    }
+    const session = getSession(sessionId);
 
     const id = uuidv4();
     const request = {
       id,
-      type: command === "join" ? "join" : "message",
-      ...(command === "join"
-        ? { channel: (params as CommandParams["join"]).channel }
-        : { channel: currentChannel }),
+      type: "message",
+      channel: session.channel,
+      sessionId,
       message: {
         id,
+        sessionId,
         command,
         params: {
           ...(params as Record<string, unknown>),
@@ -911,9 +979,10 @@ function sendCommandToFigma<T extends FigmaCommand>(
       reject,
       timeout,
       lastActivity: Date.now(),
+      sessionId,
     });
 
-    logger.info(`Sending command to Figma: ${command}`);
+    logger.info(`Sending command to Figma: ${command} [session=${sessionId}]`);
     logger.debug(`Request details: ${JSON.stringify(request)}`);
     ws.send(JSON.stringify(request));
   });
@@ -958,18 +1027,19 @@ server.tool(
 
 server.tool(
   "join_channel",
-  "Join a WebSocket relay channel to communicate with the Figma plugin. Omit channel and pass channel_description to auto-join the single matching channel from list_channels.",
+  "Create an MCP session and join a relay channel. Returns sessionId (pass on every Figma tool) and channel (paste into the Figma plugin — plugin joins by channel only). Multiple users can share a channel; sessionId isolates tool responses.",
   {
-    channel: z.string().describe("The channel name to join").optional(),
+    channel: z.string().describe("Relay channel name (shared with Figma plugin)").optional(),
     channel_description: z
       .string()
       .describe(
-        "Human-readable label for this session, or search term to auto-join an existing channel when channel is omitted"
+        "Human-readable label, or search term to auto-join an existing channel when channel is omitted"
       )
       .optional(),
   },
   async ({ channel, channel_description }) => {
     try {
+      const sessionId = uuidv4();
       const normalizedChannel = typeof channel === "string" ? channel.trim() : "";
       const normalizedDescription =
         typeof channel_description === "string" ? channel_description.trim() : "";
@@ -1001,21 +1071,55 @@ server.tool(
         resolvedChannel = generateRandomChannelName();
       }
 
-      await joinChannel(
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        connectToFigma();
+        await new Promise<void>((resolve, reject) => {
+          if (!ws) {
+            reject(new Error("WebSocket not initialized"));
+            return;
+          }
+          if (ws.readyState === WebSocket.OPEN) {
+            resolve();
+            return;
+          }
+          const onOpen = () => {
+            ws?.removeListener("error", onError);
+            resolve();
+          };
+          const onError = (err: Error) => {
+            ws?.removeListener("open", onOpen);
+            reject(err);
+          };
+          ws.once("open", onOpen);
+          ws.once("error", onError);
+        });
+      }
+
+      await relayJoinChannel(
         resolvedChannel,
+        sessionId,
         matchedByDescription ? undefined : normalizedDescription || undefined
       );
 
-      const descriptionSuffix = normalizedDescription
-        ? ` (description: ${normalizedDescription})`
-        : "";
-      const autoSuffix = matchedByDescription ? " [auto-joined by description]" : "";
+      sessions.set(sessionId, {
+        sessionId,
+        channel: resolvedChannel,
+        channelDescription: matchedByDescription
+          ? undefined
+          : normalizedDescription || undefined,
+      });
 
       return {
         content: [
           {
             type: "text",
-            text: `Successfully joined channel: ${resolvedChannel}${descriptionSuffix}${autoSuffix}`,
+            text: JSON.stringify({
+              sessionId,
+              channel: resolvedChannel,
+              message:
+                "Use sessionId on every Figma tool call. In the Figma plugin, connect using channel (not sessionId).",
+              matchedByDescription,
+            }),
           },
         ],
       };
@@ -1036,11 +1140,12 @@ server.tool(
   "get_node_info",
   "Get detailed information about a specific node in Figma. Omits child nodes with absoluteRenderBounds: null (unpainted); do not create HTML elements for those nodes.",
   {
+    sessionId: sessionIdField,
     nodeId: figmaNodeIdField("The ID of the node to get information about"),
   },
-  async ({ nodeId }) => {
+  async ({ sessionId, nodeId }) => {
     try {
-      const result = await sendCommandToFigma("get_node_info", { nodeId });
+      const result = await sendCommandToFigma(sessionId, "get_node_info", { nodeId });
       const filtered = filterFigmaNode(result as Record<string, unknown>);
       if (!filtered) {
         throw new Error(`Node not found: ${nodeId}`);
@@ -1070,11 +1175,12 @@ server.tool(
   "get_nodes_info",
   "Get detailed information about multiple nodes in Figma. Omits nodes with absoluteRenderBounds: null (unpainted).",
   {
+    sessionId: sessionIdField,
     nodeIds: figmaNodeIdArrayField("Array of node IDs to get information about"),
   },
-  async ({ nodeIds }) => {
+  async ({ sessionId, nodeIds }) => {
     try {
-      const raw = await sendCommandToFigma("get_nodes_info", { nodeIds });
+      const raw = await sendCommandToFigma(sessionId, "get_nodes_info", { nodeIds });
       const entries = raw as { nodeId: string; document: Record<string, unknown> | null }[];
       if (!Array.isArray(entries)) {
         throw new Error("Unexpected response from Figma when fetching nodes");
@@ -1117,10 +1223,11 @@ server.tool(
   "get_asset",
   "Predict whether each Figma node is an exportable icon/asset. Pass either nodeIds directly, or inputPath that points to JSON output from get_node_info/get_nodes_info so node IDs can be extracted automatically. Returns filtered node objects with assetPrediction (0–100), isAsset (score >= 50), and exportTarget (deduplicated: one export per nested asset chain — prefers the nearest isAsset INSTANCE on the path from root to the deepest asset, else parent of a vector primitive, else the deepest asset). Scoring treats visible IMAGE fills (and gifRef animated GIFs) as raster assets. Also returns exportNodeIds at the response root.",
   {
+    sessionId: sessionIdField,
     nodeIds: figmaNodeIdArrayField("Node IDs to classify as assets").optional(),
     inputPath: getAssetInputPathField,
   },
-  async ({ nodeIds, inputPath }) => {
+  async ({ sessionId, nodeIds, inputPath }) => {
     try {
       let resolvedNodeIds = nodeIds ?? [];
 
@@ -1132,7 +1239,7 @@ server.tool(
         throw new Error("Provide either nodeIds or inputPath with parseable node ids");
       }
 
-      const raw = await sendCommandToFigma("get_asset", { nodeIds: resolvedNodeIds });
+      const raw = await sendCommandToFigma(sessionId, "get_asset", { nodeIds: resolvedNodeIds });
       const entries = raw as {
         nodeId: string;
         document: Record<string, unknown> | null;
@@ -1181,13 +1288,14 @@ server.tool(
   "export_node_as_svg",
   "Export a Figma node as SVG via exportAsync (SVG_STRING). Returns UTF-8 markup; optional writePath writes a .svg file. Use outputDir for a custom absolute or relative destination (e.g. project assets folder).",
   {
+    sessionId: sessionIdField,
     nodeId: figmaNodeIdField("The ID of the node to export as SVG"),
     writePath: exportWritePathField,
     outputDir: exportOutputDirField,
   },
-  async ({ nodeId, writePath, outputDir }) => {
+  async ({ sessionId, nodeId, writePath, outputDir }) => {
     try {
-      const raw = await sendCommandToFigma("export_node_as_svg", { nodeId });
+      const raw = await sendCommandToFigma(sessionId, "export_node_as_svg", { nodeId });
       const result = raw as { svg?: string; imageData?: string; mimeType?: string };
       const parsed = parsePluginSvgPayload(result, nodeId);
 
@@ -1249,6 +1357,7 @@ server.tool(
   "export_node_as_image",
   "Export a Figma node as PNG via exportAsync. Returns base64 image data; optional writePath writes a .png file. Use outputDir for a custom absolute or relative destination (e.g. project assets folder).",
   {
+    sessionId: sessionIdField,
     nodeId: figmaNodeIdField("The ID of the node to export as PNG"),
     scale: z
       .number()
@@ -1260,9 +1369,9 @@ server.tool(
     writePath: exportWritePathField,
     outputDir: exportOutputDirField,
   },
-  async ({ nodeId, scale, writePath, outputDir }) => {
+  async ({ sessionId, nodeId, scale, writePath, outputDir }) => {
     try {
-      const raw = await sendCommandToFigma("export_node_as_image", { nodeId, scale });
+      const raw = await sendCommandToFigma(sessionId, "export_node_as_image", { nodeId, scale });
       const result = raw as {
         imageData?: string;
         mimeType?: string;
@@ -1365,10 +1474,11 @@ server.tool(
   "measure_gap_between",
   "Measure the edge-to-edge gap between two Figma nodes using their absoluteBoundingBox (works across any depth in the layer tree). Returns minimum edge gap, axis-aligned separation, center distance, and directional offsets from node A to node B.",
   {
+    sessionId: sessionIdField,
     nodeIdA: figmaNodeIdField("First node (reference)"),
     nodeIdB: figmaNodeIdField("Second node"),
   },
-  async ({ nodeIdA, nodeIdB }) => {
+  async ({ sessionId, nodeIdA, nodeIdB }) => {
     try {
       if (nodeIdA === nodeIdB) {
         return {
@@ -1381,7 +1491,7 @@ server.tool(
         };
       }
 
-      const raw = await sendCommandToFigma("get_nodes_info", {
+      const raw = await sendCommandToFigma(sessionId, "get_nodes_info", {
         nodeIds: [nodeIdA, nodeIdB],
       });
 

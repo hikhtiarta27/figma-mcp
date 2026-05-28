@@ -1,0 +1,11 @@
+node_modules
+dist
+.git
+.cursor
+*.md
+!README.md
+src/talk_to_figma_mcp
+src/cursor_mcp_plugin
+scripts
+.env
+.env.*

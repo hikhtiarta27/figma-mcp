@@ -1,16 +1,16 @@
-# Use the Bun image as the base image
-FROM oven/bun:latest
+# WebSocket relay for figma-mcp (routes MCP ↔ Figma plugin by channel + sessionId)
+FROM oven/bun:1.2-alpine
 
-# Set the working directory in the container
 WORKDIR /app
 
-# Copy the current directory contents into the container at /app
-COPY package*.json ./
+COPY src/socket.ts ./socket.ts
 
-RUN bun install
+ENV HOST=0.0.0.0
+ENV PORT=3055
 
-# Expose the port on which the API will listen
 EXPOSE 3055
 
-# Run the server when the container launches
-CMD ["bun", "src/talk_to_figma_mcp/server.ts"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD bun -e "const p=process.env.PORT||3055;fetch('http://127.0.0.1:'+p).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["bun", "socket.ts"]

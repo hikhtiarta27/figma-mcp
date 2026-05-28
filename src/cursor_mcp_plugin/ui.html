@@ -286,6 +286,15 @@
             />
           </div>
 
+          <div id="channel-id-container">
+            <label for="channel-id">Channel ID</label>
+            <input
+              type="text"
+              id="channel-id"
+              placeholder="Paste channel from join_channel (leave empty to auto-generate)"
+            />
+          </div>
+
           <div id="channel-description-container">
             <label for="channel-description">Channel Description (optional)</label>
             <input
@@ -349,6 +358,7 @@
         pendingRequests: new Map(),
         channel: null,
         channelDescription: "",
+        activeSessionId: null,
         initDone: false,
         pendingAutoConnect: false,
         savedChannelFromStorage: null,
@@ -360,6 +370,7 @@
 
       // UI Elements
       const portInput = document.getElementById("port");
+      const channelIdInput = document.getElementById("channel-id");
       const channelDescriptionInput = document.getElementById(
         "channel-description"
       );
@@ -410,6 +421,7 @@
         connectButton.textContent = isConnected ? "Disconnect" : "Connect";
         connectButton.className = isConnected ? "secondary" : "primary";
         portInput.disabled = isConnected;
+        channelIdInput.disabled = isConnected;
         channelDescriptionInput.disabled = isConnected;
 
         // Show/hide MCP config section
@@ -452,10 +464,11 @@
               state.channelDescription || channelDescriptionInput.value
             );
             state.channelDescription = effectiveChannelDescription;
+            const fromInput = normalizeChannelDescription(channelIdInput.value);
             const fromFixed =
               fixedChannelName && String(fixedChannelName).trim()
                 ? String(fixedChannelName).trim()
-                : null;
+                : fromInput || null;
             const channelName = fromFixed || generateChannelName();
             console.log("Joining channel:", channelName);
             state.channel = channelName;
@@ -602,6 +615,8 @@
         if (data.command) {
           try {
             state.activeRequestId = data.id;
+            state.activeSessionId =
+              typeof data.sessionId === "string" ? data.sessionId : null;
 
             // Send the command to the plugin code
             parent.postMessage(
@@ -671,8 +686,10 @@
             id,
             type: "message",
             channel: state.channel,
+            sessionId: state.activeSessionId || undefined,
             message: {
               id,
+              sessionId: state.activeSessionId || undefined,
               result,
             },
           })
@@ -691,8 +708,10 @@
             id,
             type: "message",
             channel: state.channel,
+            sessionId: state.activeSessionId || undefined,
             message: {
               id,
+              sessionId: state.activeSessionId || undefined,
               error: errorMessage,
               result: {},
             },
@@ -825,8 +844,10 @@
             id: requestId,
             type: "progress_update",
             channel: state.channel,
+            sessionId: state.activeSessionId || undefined,
             message: {
               id: requestId,
+              sessionId: state.activeSessionId || undefined,
               type: "progress_update",
               data: progressData,
             },
