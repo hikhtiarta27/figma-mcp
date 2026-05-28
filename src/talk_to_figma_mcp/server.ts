@@ -234,7 +234,7 @@ let currentChannel: string | null = null;
 let currentChannelDescription: string | null = null;
 
 const server = new McpServer({
-  name: "TalkToFigmaMCPv2",
+  name: "figma-mcp",
   version: "2.0.0",
 });
 
@@ -1178,7 +1178,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   logger.info(
-    "TalkToFigmaMCP v2 running on stdio (tools: list_channels, join_channel, get_node_info, get_nodes_info, get_asset, export_node_as_svg, export_node_as_image, measure_gap_between)"
+    "figma-mcp running on stdio (tools: list_channels, join_channel, get_node_info, get_nodes_info, get_asset, export_node_as_svg, export_node_as_image, measure_gap_between)"
   );
 }
 

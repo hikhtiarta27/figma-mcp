@@ -57,9 +57,9 @@ The MCP config written by `bun setup` uses the published package:
 ```json
 {
   "mcpServers": {
-    "TalkToFigma": {
+    "figma-mcp": {
       "command": "bunx",
-      "args": ["cursor-talk-to-figma-mcp@latest"]
+      "args": ["figma-mcp@latest"]
     }
   }
 }
@@ -68,5 +68,5 @@ The MCP config written by `bun setup` uses the published package:
 You can also add it manually for Claude Code via the CLI:
 
 ```bash
-claude mcp add TalkToFigma -- bunx cursor-talk-to-figma-mcp@latest
+claude mcp add figma-mcp -- bunx figma-mcp@latest
 ```

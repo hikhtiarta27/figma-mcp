@@ -2,10 +2,10 @@
 
 MCP_CONFIG='{
   "mcpServers": {
-    "TalkToFigma": {
+    "figma-mcp": {
       "command": "bunx",
       "args": [
-        "cursor-talk-to-figma-mcp@latest"
+        "figma-mcp@latest"
       ]
     }
   }

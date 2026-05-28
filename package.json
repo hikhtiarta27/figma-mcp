@@ -1,11 +1,11 @@
 {
-  "name": "cursor-talk-to-figma-mcp",
-  "description": "Cursor Talk to Figma MCP",
+  "name": "figma-mcp",
+  "description": "MCP server for Figma — read nodes, export assets, measure layout",
   "version": "0.3.5",
   "module": "dist/server.js",
   "main": "dist/server.js",
   "bin": {
-    "cursor-talk-to-figma-mcp": "dist/server.js"
+    "figma-mcp": "dist/server.js"
   },
   "files": [
     "dist",

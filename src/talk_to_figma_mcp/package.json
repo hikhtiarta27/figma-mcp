@@ -1,7 +1,7 @@
 {
-  "name": "talk-to-figma-mcp-v2",
+  "name": "figma-mcp",
   "version": "2.0.0",
-  "description": "Minimal MCP server for Figma — node info only",
+  "description": "MCP server for Figma — read nodes, export assets, measure layout",
   "main": "server.ts",
   "type": "module",
   "scripts": {
