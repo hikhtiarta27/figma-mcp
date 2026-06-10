@@ -24,7 +24,7 @@ bun socket         # relay on ws://localhost:3055
 
 2. In Figma: **Plugins → Development → Link existing plugin** → `src/cursor_mcp_plugin/manifest.json`, run the plugin, and join the same channel the agent uses.
 
-3. In the agent: call `list_channels` / `join_channel` before any Figma command.
+3. In the agent: call `list_channels`, then `join_channel` (match by `channel_description` or `channel` from the list) before any other Figma command.
 
 ### MCP config
 
@@ -59,7 +59,7 @@ Local development:
 | Tool | Purpose |
 |------|---------|
 | `list_channels` | Active relay channels (name, client count, description) |
-| `join_channel` | Join by name and/or `channel_description` (auto-match or create) |
+| `join_channel` | Join by `channel` and/or `channel_description`; call `list_channels` first to match the plugin |
 | `get_node_info` | Single node tree (filtered) |
 | `get_nodes_info` | Batch node trees |
 | `get_asset` | Asset prediction scores and `exportNodeIds` |
@@ -71,7 +71,7 @@ Node IDs: Figma API form (`2403:34143`), URL form (`2403-34143`), or instance pa
 
 ## Notes for agents
 
-- **`join_channel` first** — no Figma calls work until the MCP server and plugin share a channel.
+- **`list_channels` then `join_channel`** — list active plugin channels first; join by matching `channel_description` (Figma file name) or exact `channel` from the list. Skip listing only when the user supplied a channel ID. No other Figma calls work until MCP and plugin share a channel.
 - **Unpainted nodes** — `get_node_info` / `get_nodes_info` omit children with `absoluteRenderBounds: null`; do not emit HTML for them.
 - **Export** — prefer `export_node_as_svg` when the subtree has **< 3** vector primitives and SVG is **≤ 8 KB**; otherwise `export_node_as_image` (`scale: 2`–`4`). Use `outputDir` to write under your project (absolute or relative to MCP server cwd).
 - **WSL** — uncomment `hostname: "0.0.0.0"` in `src/socket.ts` if the plugin cannot reach the relay.

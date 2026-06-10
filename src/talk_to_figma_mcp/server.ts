@@ -999,7 +999,7 @@ function generateRandomChannelName(length: number = 8): string {
 
 server.tool(
   "list_channels",
-  "List all WebSocket relay channels that currently have at least one connected client. Each entry includes name, clientCount, and optional description (set when a client joins with channel_description). Use list_channels then join_channel with a matching description to connect automatically.",
+  "List WebSocket relay channels with at least one connected client. Returns name, clientCount, and optional description (the Figma plugin sets description to the open file name). Call this BEFORE join_channel when matching an open Figma file — then join_channel with channel_description (or channel from this list). Do not skip when the user shared a Figma link; the URL title is not the channel ID.",
   {},
   async () => {
     try {
@@ -1027,13 +1027,18 @@ server.tool(
 
 server.tool(
   "join_channel",
-  "Create an MCP session and join a relay channel. Returns sessionId (pass on every Figma tool) and channel (paste into the Figma plugin — plugin joins by channel only). Multiple users can share a channel; sessionId isolates tool responses.",
+  "Join a relay channel and create an MCP session. Returns sessionId (required on every Figma tool) and channel. When matching an open Figma file, call list_channels first, then join with channel_description (file name from the list) and omit channel — do not invent a channel from the Figma URL. Pass channel only when using an exact ID from list_channels or from the user. Omitting both channel and a matching channel_description creates a new random channel that the plugin will not be on.",
   {
-    channel: z.string().describe("Relay channel name (shared with Figma plugin)").optional(),
+    channel: z
+      .string()
+      .describe(
+        "Exact relay channel name from list_channels or the Figma plugin UI. Do not derive from a Figma URL slug or file key."
+      )
+      .optional(),
     channel_description: z
       .string()
       .describe(
-        "Human-readable label, or search term to auto-join an existing channel when channel is omitted"
+        "Figma file name to match an existing channel (from list_channels). Omit channel when using this. Call list_channels first."
       )
       .optional(),
   },

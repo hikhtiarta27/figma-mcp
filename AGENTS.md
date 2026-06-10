@@ -74,7 +74,13 @@ claude mcp add figma-mcp -- bunx figma-mcp@latest
 
 - For static HTML from Figma: **SVG** only if **< 3** vector primitives in the export subtree **and** SVG **≤ 8 KB**; else **PNG** (`export_node_as_image` or `--export-png` CLI). See `.cursor/commands/implement-design.md` §4.
 - **Do not emit HTML elements** for nodes where `absoluteRenderBounds` is `null` (unpainted on canvas). `get_node_info` already omits these from the returned tree.
-- Always call `join_channel` before issuing any Figma commands
+- **Channel workflow** — the Figma plugin must be connected before the agent can reach it. When matching an open Figma file (including from a share link), call **`list_channels` first**, then **`join_channel`**:
+  1. Ensure the Figma plugin is running and connected to the relay.
+  2. `list_channels` — read active channels (`name`, `description`, `clientCount`). The plugin sets `description` to the Figma file name (`figma.root.name`).
+  3. `join_channel` with **`channel_description`** set to that file name (omit `channel` so the server matches an existing channel). Or pass the exact **`channel`** `name` from the list if the user pasted it.
+  4. Do **not** use the Figma URL slug or file key as `channel` — those are unrelated to relay channel IDs.
+  5. Only call `join_channel` without `list_channels` when the user already gave you an exact channel ID to paste.
+  6. After joining, pass `sessionId` on every Figma tool call.
 - Call `get_document_info` first to understand the design structure
 - Use `read_my_design` or `get_selection` before making modifications
 - Batch operations (`set_multiple_text_contents`, `delete_multiple_nodes`, `set_multiple_annotations`) are preferred over repeated single-node calls for performance
