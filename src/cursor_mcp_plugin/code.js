@@ -317,7 +317,7 @@ async function getPageLayers(params) {
   // Page contents must be loaded before traversal/selection in
   // dynamic-page documents (see manifest.json).
   await page.loadAsync();
-  figma.currentPage = page;
+  await figma.setCurrentPageAsync(page);
 
   const typeFilter = Array.isArray(types) && types.length > 0 ? types : null;
   const layers = [];
