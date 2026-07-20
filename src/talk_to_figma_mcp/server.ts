@@ -525,6 +525,8 @@ type FigmaCommand =
   | "get_asset"
   | "export_node_as_svg"
   | "export_node_as_image"
+  | "list_pages"
+  | "get_page_layers"
   | "join";
 
 type CommandParams = {
@@ -533,6 +535,8 @@ type CommandParams = {
   get_asset: { nodeIds: string[] };
   export_node_as_svg: { nodeId: string };
   export_node_as_image: { nodeId: string; scale?: number };
+  list_pages: Record<string, never>;
+  get_page_layers: { pageId: string; types?: string[]; maxDepth?: number };
   join: { channel: string; channel_description?: string };
 };
 
@@ -1134,6 +1138,79 @@ server.tool(
           {
             type: "text",
             text: `Error joining channel: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "list_pages",
+  "List all pages in the current Figma document (id, name, childCount), using loadAllPagesAsync to ensure pages are fully loaded first. Useful for dynamic-page documents where not every page is loaded by default.",
+  {
+    sessionId: sessionIdField,
+  },
+  async ({ sessionId }) => {
+    try {
+      const result = await sendCommandToFigma(sessionId, "list_pages", {});
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error listing pages: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "get_page_layers",
+  "Select a page by ID (setting it as figma.currentPage) and return a flattened list of layers (id, name, type, depth) inside it. Optionally filter by node type or cap traversal depth. Truncates at 5000 layers (response includes truncated: true) — narrow with types or maxDepth for very large pages.",
+  {
+    sessionId: sessionIdField,
+    pageId: z.string().describe("The ID of the page to select (from list_pages)."),
+    types: z
+      .array(z.string())
+      .describe("Only include nodes whose type is in this list (e.g. [\"FRAME\", \"TEXT\"]).")
+      .optional(),
+    maxDepth: z
+      .number()
+      .describe("Maximum traversal depth below the page (0 = only top-level children).")
+      .optional(),
+  },
+  async ({ sessionId, pageId, types, maxDepth }) => {
+    try {
+      const result = await sendCommandToFigma(sessionId, "get_page_layers", {
+        pageId,
+        types,
+        maxDepth,
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(result),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error getting page layers: ${error instanceof Error ? error.message : String(error)}`,
           },
         ],
       };

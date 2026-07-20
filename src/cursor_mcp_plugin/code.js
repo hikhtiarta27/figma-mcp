@@ -202,6 +202,13 @@ async function handleCommand(command, params) {
   switch (command) {
     case "get_document_info":
       return await getDocumentInfo();
+    case "list_pages":
+      return await listPages();
+    case "get_page_layers":
+      if (!params || !params.pageId) {
+        throw new Error("Missing pageId parameter");
+      }
+      return await getPageLayers(params);
     case "get_selection":
       return await getSelection();
     case "get_node_info":
@@ -279,6 +286,78 @@ async function getDocumentInfo() {
         childCount: page.children.length,
       },
     ],
+  };
+}
+
+async function listPages() {
+  // loadAllPagesAsync is required before reading figma.root.children in
+  // documents with dynamic-page loading enabled (see manifest.json).
+  await figma.loadAllPagesAsync();
+  return {
+    pages: figma.root.children.map((page) => ({
+      id: page.id,
+      name: page.name,
+      childCount: page.children.length,
+    })),
+    count: figma.root.children.length,
+  };
+}
+
+const GET_PAGE_LAYERS_MAX_LAYERS = 5000;
+
+// Select a page and flatten all (or filtered) layers inside it
+async function getPageLayers(params) {
+  const { pageId, types, maxDepth } = params || {};
+
+  const page = await figma.getNodeByIdAsync(pageId);
+  if (!page || page.type !== "PAGE") {
+    throw new Error(`Page not found with ID: ${pageId}`);
+  }
+
+  // Page contents must be loaded before traversal/selection in
+  // dynamic-page documents (see manifest.json).
+  await page.loadAsync();
+  figma.currentPage = page;
+
+  const typeFilter = Array.isArray(types) && types.length > 0 ? types : null;
+  const layers = [];
+  let truncated = false;
+
+  function walk(node, depth) {
+    if (truncated || node.visible === false) return;
+
+    if (!typeFilter || typeFilter.includes(node.type)) {
+      if (layers.length >= GET_PAGE_LAYERS_MAX_LAYERS) {
+        truncated = true;
+        return;
+      }
+      layers.push({
+        id: node.id,
+        name: node.name || `Unnamed ${node.type}`,
+        type: node.type,
+        depth,
+      });
+    }
+
+    if ("children" in node && (maxDepth == null || depth < maxDepth)) {
+      for (const child of node.children) {
+        walk(child, depth + 1);
+        if (truncated) break;
+      }
+    }
+  }
+
+  for (const child of page.children) {
+    walk(child, 0);
+    if (truncated) break;
+  }
+
+  return {
+    pageId: page.id,
+    pageName: page.name,
+    count: layers.length,
+    truncated,
+    layers,
   };
 }
 
